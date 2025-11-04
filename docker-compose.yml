@@ -1,0 +1,30 @@
+version: "3"
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: react-frontend
+    env_file:
+      - ./frontend/.env
+    ports:
+      - "3000:80"        # React app accessible on host:3000
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    container_name: api-backend
+    command: gunicorn excel_backend.wsgi:application --bind 0.0.0.0:8000
+    env_file:
+      - ./frontend/.env    # if you have backend env variables
+    environment:
+      - SPRING_PROFILES_ACTIVE=prod
+      - DJANGO_ALLOWED_HOSTS=127.0.0.1,localhost,72.60.202.207
+    ports:
+      - "8000:8000"      # backend accessible on host:8000
+    restart: unless-stopped
+
+
