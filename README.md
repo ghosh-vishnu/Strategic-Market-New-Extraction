@@ -11,6 +11,7 @@ A full-stack application for converting Word documents to Excel format with adva
 - **Auto Cleanup**: Automatic database cleanup after download
 - **Thread-Safe Operations**: Thread-safe job tracking with proper locking
 - **Production Ready**: Configured for both local development and production deployment
+- **Automated Testing**: Pytest-based regression tests for the extractor and conversion logic
 
 ## 🚀 Tech Stack
 
@@ -32,6 +33,7 @@ A full-stack application for converting Word documents to Excel format with adva
 - Python 3.13+
 - Node.js 18+
 - npm or yarn
+- pytest (installed via `requirements.txt`)
 
 ## 🔧 Installation
 
@@ -66,6 +68,18 @@ npm install
 # Start development server
 npm run dev
 ```
+
+## 🧪 Testing
+
+```bash
+# From the project root
+cd backend
+
+# Run the backend/unit tests
+pytest
+```
+
+The repository does not ship large sample Word documents. Bring your own `.docx` inputs when running conversions locally. Frontend unit tests are not yet configured (`npm run test` currently exits with a placeholder message).
 
 ## 🔀 Switching Between Local and Production
 
@@ -177,8 +191,11 @@ Strategic-Market/
 │   │   ├── AuthContext.tsx    # Authentication
 │   │   └── WordToExcel.tsx    # Main component
 │   └── package.json
+├── test_*.py                  # Pytest suites for extraction & conversion
 └── README.md
 ```
+
+> Note: Legacy market report `.docx` samples have been removed from source control to keep the repository lightweight.
 
 ## 🚀 Production Deployment
 

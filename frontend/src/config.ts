@@ -6,8 +6,28 @@
 // Production URL (ACTIVE - FOR PRODUCTION)
 // export const API_BASE_URL = (import.meta as any).env?.VITE_API_BASE_URL || 'http://72.60.202.207:8000';
 
+const envApiBase = (import.meta as any).env?.VITE_API_BASE_URL as string | undefined;
+
+function normalizeLocalBaseUrl(url: string | undefined): string | undefined {
+  if (!url) return url;
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname === '127.0.0.1') {
+      parsed.hostname = 'localhost';
+    }
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    return url;
+  }
+}
+
+const defaultLocalBase =
+  typeof window !== 'undefined' && window.location.hostname === 'localhost'
+    ? `http://localhost:8000`
+    : 'http://localhost:8000';
+
 // Local Development URL (FOR LOCAL - UNCOMMENT TO USE)
-export const API_BASE_URL = (import.meta as any).env?.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+export const API_BASE_URL = normalizeLocalBaseUrl(envApiBase) || defaultLocalBase;
 
 export const API_ENDPOINTS = {
   AUTH: {

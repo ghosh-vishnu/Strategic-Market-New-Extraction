@@ -12,6 +12,8 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 
 from pathlib import Path
 from corsheaders.defaults import default_headers
+import os
+from django.core.exceptions import ImproperlyConfigured
 
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -21,24 +23,41 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-import os
-SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-7gpbevknk^uwa8$4h=e43pwy%p!vt5@*58wm82jo=-b#a*%0+0')
+
+def get_env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def get_env_list(name: str, default: str = "") -> list[str]:
+    value = os.environ.get(name, default)
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
 
 # SECURITY WARNING: don't run with debug turned on in production!
+DEBUG = get_env_bool("DJANGO_DEBUG", default=True)
 
-# Production settings
-# To switch between Production and Local:
-# 1. Comment the active lines
-# 2. Uncomment the lines you want to use
+# SECURITY WARNING: keep the secret key used in production secret!
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = "dev-secret-key"
+    else:
+        raise ImproperlyConfigured("DJANGO_SECRET_KEY environment variable is required when DEBUG is False")
 
-# Production mode (ACTIVE - FOR PRODUCTION)
-# DEBUG = False
-# ALLOWED_HOSTS = ['127.0.0.1', 'localhost', '0.0.0.0', '72.60.202.207']
+default_allowed_hosts = "127.0.0.1,localhost,0.0.0.0"
+ALLOWED_HOSTS = get_env_list("DJANGO_ALLOWED_HOSTS", default_allowed_hosts)
+if not ALLOWED_HOSTS:
+    ALLOWED_HOSTS = default_allowed_hosts.split(",")
 
-# Local Development mode (FOR LOCAL - UNCOMMENT TO USE)
-DEBUG = True
-ALLOWED_HOSTS = ['127.0.0.1', 'localhost', '0.0.0.0']
+default_csrf_trusted = "http://localhost:5173,http://127.0.0.1:5173"
+CSRF_TRUSTED_ORIGINS = get_env_list("DJANGO_CSRF_TRUSTED_ORIGINS", default_csrf_trusted)
+if not CSRF_TRUSTED_ORIGINS:
+    CSRF_TRUSTED_ORIGINS = default_csrf_trusted.split(",")
 
 # Application definition
 
@@ -57,6 +76,15 @@ INSTALLED_APPS = [
 # Custom User Model
 AUTH_USER_MODEL = 'converter.CustomUser'
 
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework.authentication.SessionAuthentication',
+    ),
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.IsAuthenticated',
+    ),
+}
+
 
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
@@ -71,9 +99,6 @@ MIDDLEWARE = [
 ]
 
 # Media (uploads)
-import os
-from pathlib import Path
-BASE_DIR = Path(__file__).resolve().parent.parent
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 APPEND_SLASH = False
@@ -147,13 +172,10 @@ USE_I18N = True
 
 USE_TZ = True
 # CORS Configuration
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://localhost:5174",
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:5174",
-    "http://72.60.202.207:3000",  # Production URL
-]
+default_cors = "http://localhost:5173,http://127.0.0.1:5173"
+CORS_ALLOWED_ORIGINS = get_env_list("DJANGO_CORS_ALLOWED_ORIGINS", default_cors)
+if not CORS_ALLOWED_ORIGINS:
+    CORS_ALLOWED_ORIGINS = default_cors.split(",")
 
 CORS_ALLOW_CREDENTIALS = True
 
@@ -194,18 +216,23 @@ SESSION_ENGINE = 'django.contrib.sessions.backends.db'  # Use database sessions
 
 # Additional session settings for production
 # Use secure cookies in production (HTTPS)
-SESSION_COOKIE_SECURE = os.environ.get('SESSION_COOKIE_SECURE', 'False').lower() in ['true', '1', 'yes']
-CSRF_COOKIE_SECURE = os.environ.get('CSRF_COOKIE_SECURE', 'False').lower() in ['true', '1', 'yes']
-SESSION_COOKIE_SAMESITE = "Lax"
+SESSION_COOKIE_SECURE = get_env_bool('SESSION_COOKIE_SECURE', default=not DEBUG)
+CSRF_COOKIE_SECURE = get_env_bool('CSRF_COOKIE_SECURE', default=not DEBUG)
+SESSION_COOKIE_HTTPONLY = get_env_bool('SESSION_COOKIE_HTTPONLY', default=True)
+CSRF_COOKIE_HTTPONLY = get_env_bool('CSRF_COOKIE_HTTPONLY', default=False)
+SESSION_COOKIE_SAMESITE = os.environ.get('SESSION_COOKIE_SAMESITE', 'Strict' if not DEBUG else 'Lax')
 SESSION_COOKIE_DOMAIN = os.environ.get('SESSION_COOKIE_DOMAIN', None)  # None allows localhost
-SESSION_COOKIE_HTTPONLY = os.environ.get('SESSION_COOKIE_HTTPONLY', 'False').lower() in ['true', '1', 'yes']
 
 # CSRF settings
-CSRF_COOKIE_HTTPONLY = False
-CSRF_COOKIE_SAMESITE = 'Lax'
+CSRF_COOKIE_SAMESITE = os.environ.get('CSRF_COOKIE_SAMESITE', 'Lax')
 
 # Connection settings
 CONN_MAX_AGE = 60
+
+# HTTPS / proxy settings
+SECURE_SSL_REDIRECT = get_env_bool('SECURE_SSL_REDIRECT', default=not DEBUG)
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+SECURE_REFERRER_POLICY = os.environ.get('SECURE_REFERRER_POLICY', 'same-origin')
 
 # Logging configuration
 LOGGING = {

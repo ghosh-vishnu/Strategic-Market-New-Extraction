@@ -4,6 +4,7 @@ import { useTheme } from "./src/useTheme";
 import { useAuth } from "./src/AuthContext";
 import ProfileDropdown from "./src/ProfileDropdown";
 import { API_BASE_URL, API_ENDPOINTS } from "./src/config";
+import { ensureCsrfToken } from "./src/csrf";
 
 type FileItem = {
   id: string;
@@ -26,13 +27,72 @@ const PROGRESS_PATH = (import.meta as any).env?.VITE_PROGRESS_PATH || "/api/prog
 const RESULT_PATH = (import.meta as any).env?.VITE_RESULT_PATH || "/api/result/";
 
 
-async function uploadFolderToBackend(files: File[], jobId?: string): Promise<{ jobId: string }>{
+type JsonRecord = Record<string, unknown>;
+
+async function authorizedFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const method = (init.method ?? 'GET').toString().toUpperCase();
+  const headers = new Headers(init.headers ?? {});
+
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+    const csrfToken = await ensureCsrfToken();
+    if (csrfToken) {
+      headers.set('X-CSRFToken', csrfToken);
+    }
+  }
+
+  const response = await fetch(input, {
+    ...init,
+    headers,
+    credentials: 'include',
+  });
+
+  if (response.status === 401 || response.status === 403) {
+    const error: Error & { code?: string; status?: number; response?: Response } = new Error('Your session has expired. Please sign in again.');
+    error.code = 'unauthorized';
+    error.status = response.status;
+    error.response = response;
+    throw error;
+  }
+
+  return response;
+}
+
+async function parseJsonResponse<T extends JsonRecord>(response: Response, fallbackMessage: string): Promise<T> {
+  const text = await response.text();
+  let data: JsonRecord = {};
+
+  if (text) {
+    try {
+      data = JSON.parse(text) as JsonRecord;
+    } catch (error) {
+      if (response.ok) {
+        throw new Error(fallbackMessage);
+      }
+      throw new Error(text);
+    }
+  }
+
+  if (!response.ok) {
+    const message = data?.message ?? data?.detail ?? fallbackMessage;
+    const extraFiles = Array.isArray((data as { files?: unknown }).files)
+      ? ((data as { files?: unknown }).files as unknown[]).map(String)
+      : [];
+    const extra = extraFiles.length > 0 ? ` (${extraFiles.join(', ')})` : '';
+    if (typeof message === 'string' && message.trim()) {
+      throw new Error(`${message}${extra}`);
+    }
+    throw new Error(fallbackMessage);
+  }
+
+  return data as T;
+}
+
+async function uploadFolderToBackend(files: File[], jobId?: string): Promise<{ jobId: string }> {
   const formData = new FormData();
   files.forEach((file) => formData.append("files", file, (file as any).webkitRelativePath || file.name));
   const url = jobId ? `${API_BASE_URL}${UPLOAD_PATH}?jobId=${encodeURIComponent(jobId)}` : `${API_BASE_URL}${UPLOAD_PATH}`;
-  const res = await fetch(url , { method: "POST", body: formData });
-  if (!res.ok) throw new Error("Upload failed");
-  return res.json();
+  const response = await authorizedFetch(url, { method: "POST", body: formData });
+  return parseJsonResponse<{ jobId: string }>(response, "Upload failed");
 }
 
 async function uploadExcelSheet(excelFile: File, jobId: string): Promise<{ success: boolean; message: string; entries: number }>{
@@ -40,12 +100,11 @@ async function uploadExcelSheet(excelFile: File, jobId: string): Promise<{ succe
   formData.append("excelFile", excelFile);
   formData.append("jobId", jobId);
   
-  const res = await fetch(API_ENDPOINTS.UPLOAD_EXCEL, { 
+  const response = await authorizedFetch(API_ENDPOINTS.UPLOAD_EXCEL, { 
     method: "POST", 
     body: formData 
   });
-  if (!res.ok) throw new Error("Excel upload failed");
-  return res.json();
+  return parseJsonResponse<{ success: boolean; message: string; entries: number }>(response, "Excel upload failed");
 }
 
 async function uploadExtractExcel(excelFile: File, jobId: string): Promise<{ success: boolean; message: string; entries: number }>{
@@ -53,14 +112,12 @@ async function uploadExtractExcel(excelFile: File, jobId: string): Promise<{ suc
   formData.append("excelFile", excelFile);
   formData.append("jobId", jobId);
   
-  const res = await fetch(API_ENDPOINTS.UPLOAD_EXTRACT_EXCEL, { 
+  const response = await authorizedFetch(API_ENDPOINTS.UPLOAD_EXTRACT_EXCEL, { 
     method: "POST", 
     body: formData 
   });
-  if (!res.ok) throw new Error("Extract Excel upload failed");
-  return res.json();
+  return parseJsonResponse<{ success: boolean; message: string; entries: number }>(response, "Extract Excel upload failed");
 }
-
 
 function chunkArray<T>(arr: T[], size: number): T[][] {
   const chunks: T[][] = [];
@@ -72,41 +129,36 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
 
 async function startBackendConversion(jobId: string): Promise<{ started: boolean }>{
   const url = `${API_BASE_URL}${CONVERT_PATH}?jobId=${encodeURIComponent(jobId)}`;
-  const res = await fetch(url, { method: "POST" });
-  if (!res.ok) throw new Error("Failed to start conversion");
-  return res.json();
+  const response = await authorizedFetch(url, { method: "POST" });
+  return parseJsonResponse<{ started: boolean }>(response, "Failed to start conversion");
 }
 
 async function pollConversionProgress(jobId: string): Promise<{ progress: number; done: boolean; error?: string; status_message?: string }>{
   const url = `${API_BASE_URL}${PROGRESS_PATH}?jobId=${encodeURIComponent(jobId)}`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    const errorText = await res.text();
-    console.error(`Progress check failed: ${res.status} - ${errorText}`);
-    throw new Error(`Progress check failed: ${res.status}`);
-  }
-  return res.json();
+  const response = await authorizedFetch(url);
+  return parseJsonResponse<{ progress: number; done: boolean; error?: string; status_message?: string }>(response, "Progress check failed");
 }
 
 async function fetchConversionResult(jobId: string): Promise<ConversionResult>{
-  // Prefer CSV text if user wants to open in a new tab easily; keep xlsx fallback by toggling query
   const endpointUrl = `${API_BASE_URL}${RESULT_PATH}?jobId=${encodeURIComponent(jobId)}`;
-  const res = await fetch(endpointUrl);
-  if (!res.ok) {
-    const errorText = await res.text();
-    console.error(`Result fetch failed: ${res.status} - ${errorText}`);
-    throw new Error(`Result not ready: ${res.status}`);
+  const response = await authorizedFetch(endpointUrl);
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(errorText || `Result not ready: ${response.status}`);
   }
-  const blob = await res.blob();
+  const blob = await response.blob();
   const resultUrl = URL.createObjectURL(blob);
   return { downloadUrl: resultUrl, openUrl: resultUrl };
 }
 
 async function fetchConversionCsv(jobId: string): Promise<string> {
   const endpointUrl = `${API_BASE_URL}${RESULT_PATH}?jobId=${encodeURIComponent(jobId)}&format=csv`;
-  const res = await fetch(endpointUrl);
-  if (!res.ok) throw new Error("CSV not ready");
-  return res.text();
+  const response = await authorizedFetch(endpointUrl);
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(errorText || "CSV not ready");
+  }
+  return response.text();
 }
 
 function bytesToReadable(size: number): string {
@@ -130,6 +182,7 @@ export default function WordToExcel(): React.ReactElement {
   const [extractFileUploaded, setExtractFileUploaded] = useState<boolean>(false);
   const [mappingFileUploaded, setMappingFileUploaded] = useState<boolean>(false);
   const [showApplyMappingButton, setShowApplyMappingButton] = useState<boolean>(false);
+  const { logout } = useAuth();
   const { isDarkMode, toggleTheme } = useTheme();
 
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -140,12 +193,21 @@ export default function WordToExcel(): React.ReactElement {
 
   const hasFiles = files.length > 0 || extractFileUploaded;
 
-  const acceptedExtensions = React.useMemo(() => [
+  const acceptedExtensions = useMemo(() => [
     ".doc",
     ".docx",
     ".rtf",
     ".odt",
   ], []);
+
+  const handleAuthError = useCallback((error: unknown) => {
+    if (error && typeof error === "object" && (error as { code?: string }).code === "unauthorized") {
+      setErrorMessage("Your session has expired. Please sign in again.");
+      void logout();
+      return true;
+    }
+    return false;
+  }, [logout]);
 
   const onFileInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const fileList = e.target.files;
@@ -217,11 +279,13 @@ export default function WordToExcel(): React.ReactElement {
 
   const resetAll = useCallback(async () => {
     try {
-      // Inform backend to cancel current job and clear any queued files
-      const url = jobId ? `${API_BASE_URL}${RESULT_PATH.replace('/result/', '/reset/')}?jobId=${encodeURIComponent(jobId)}` : `${API_BASE_URL}${RESULT_PATH.replace('/result/', '/reset/')}`;
-      await fetch(url, { method: "POST" }).catch(() => {});
-    } catch {
-      // ignore network errors on reset
+      const resetPath = RESULT_PATH.replace('/result/', '/reset/');
+      const url = jobId ? `${API_BASE_URL}${resetPath}?jobId=${encodeURIComponent(jobId)}` : `${API_BASE_URL}${resetPath}`;
+      await authorizedFetch(url, { method: "POST" });
+    } catch (error) {
+      if (!handleAuthError(error)) {
+        console.error('Reset failed', error);
+      }
     } finally {
       setFiles([]);
       setJobId(null);
@@ -241,7 +305,7 @@ export default function WordToExcel(): React.ReactElement {
         pollingRef.current = null;
       }
     }
-  }, [jobId]);
+  }, [jobId, handleAuthError]);
 
   const handleExtractFileUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -258,38 +322,33 @@ export default function WordToExcel(): React.ReactElement {
       // If no jobId exists, create a new one for direct Excel upload
       let currentJobId = jobId;
       if (!currentJobId) {
-        // Create a new job for direct Excel upload
-        const response = await fetch(API_ENDPOINTS.UPLOAD_DIRECT_EXCEL, {
+        const formData = new FormData();
+        formData.append('excelFile', file);
+        const response = await authorizedFetch(API_ENDPOINTS.UPLOAD_DIRECT_EXCEL, {
           method: 'POST',
-          body: (() => {
-            const formData = new FormData();
-            formData.append('excelFile', file);
-            return formData;
-          })(),
+          body: formData,
         });
-        
-        if (!response.ok) {
-          throw new Error('Failed to create job for direct Excel upload');
-        }
-        
-        const data = await response.json();
+
+        const data = await parseJsonResponse<{ jobId: string; entries: number }>(response, 'Failed to create job for direct Excel upload');
         currentJobId = data.jobId;
         setJobId(currentJobId);
         setExtractFileUploaded(true);
         setStatusMessage(`${data.entries} entries - Ready for mapping`);
         return;
-      } else {
-        // Use existing jobId for regular extract Excel upload
-        const result = await uploadExtractExcel(file, currentJobId);
-        setExtractFileUploaded(true);
-        setStatusMessage(`${result.entries} entries`);
       }
+
+      const result = await uploadExtractExcel(file, currentJobId);
+      setExtractFileUploaded(true);
+      setStatusMessage(`${result.entries} entries`);
     } catch (error) {
+      if (handleAuthError(error)) {
+        return;
+      }
       console.error(`Extract Excel upload error:`, error);
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       setErrorMessage(`Extract Excel upload failed: ${errorMessage}`);
     }
-  }, [jobId]);
+  }, [jobId, handleAuthError]);
 
   const handleMappingFileUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -308,11 +367,14 @@ export default function WordToExcel(): React.ReactElement {
       setShowApplyMappingButton(true);
       setStatusMessage(`Mapping Excel uploaded: ${result.entries} entries.`);
     } catch (error) {
+      if (handleAuthError(error)) {
+        return;
+      }
       console.error(`Mapping Excel upload error:`, error);
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       setErrorMessage(`Mapping Excel upload failed: ${errorMessage}`);
     }
-  }, [jobId]);
+  }, [jobId, handleAuthError]);
 
   const handleExcelUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -329,11 +391,14 @@ export default function WordToExcel(): React.ReactElement {
       setStatusMessage(`Excel uploaded: ${result.entries} entries.`);
       setExcelUploaded(true);
     } catch (error) {
+      if (handleAuthError(error)) {
+        return;
+      }
       console.error(`Excel upload error:`, error);
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       setErrorMessage(`Excel upload failed: ${errorMessage}`);
     }
-  }, [jobId]);
+  }, [jobId, handleAuthError]);
 
   const applyMapping = useCallback(async () => {
     // Check if both files are uploaded
@@ -351,17 +416,12 @@ export default function WordToExcel(): React.ReactElement {
       const formData = new FormData();
       formData.append('jobId', jobId!);
       
-      const response = await fetch(API_ENDPOINTS.APPLY_MAPPING, {
+      const response = await authorizedFetch(API_ENDPOINTS.APPLY_MAPPING, {
         method: "POST",
         body: formData,
       });
-      
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.message || errorData.error || "Failed to apply mapping");
-      }
-      
-      const result = await response.json();
+
+      await parseJsonResponse<{ success: boolean; message: string }>(response, "Failed to apply mapping");
       setExcelUploaded(true);
       setMappingApplied(true);
       setShowApplyMappingButton(false);
@@ -372,10 +432,14 @@ export default function WordToExcel(): React.ReactElement {
       
       setIsConverting(false);
     } catch (error) {
+      if (handleAuthError(error)) {
+        setIsConverting(false);
+        return;
+      }
       setErrorMessage(`Mapping failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       setIsConverting(false);
     }
-  }, [jobId, extractFileUploaded, mappingFileUploaded]);
+  }, [jobId, extractFileUploaded, mappingFileUploaded, handleAuthError]);
 
   const beginConversion = useCallback(async () => {
     try {
@@ -470,6 +534,10 @@ export default function WordToExcel(): React.ReactElement {
             pollingRef.current = null;
           }
           setIsConverting(false);
+          if (handleAuthError(err)) {
+            setStatusMessage("");
+            return;
+          }
           const errorMessage = err?.message || "An error occurred during conversion.";
           console.error("Conversion polling error:", errorMessage);
           setErrorMessage(errorMessage);
@@ -480,9 +548,12 @@ export default function WordToExcel(): React.ReactElement {
       setIsUploading(false);
       setIsConverting(false);
       setStatusMessage("");
+      if (handleAuthError(err)) {
+        return;
+      }
       setErrorMessage(err?.message || "Failed to start conversion.");
     }
-  }, [files, updateFileStatus]);
+  }, [files, updateFileStatus, handleAuthError]);
 
   return (
     <div className={`min-h-screen ${isDarkMode ? 'bg-gray-950 text-gray-100' : 'bg-gray-50 text-gray-800'}`}>

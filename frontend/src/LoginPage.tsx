@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { motion } from 'framer-motion';
 import { useTheme } from './useTheme';
 import { API_ENDPOINTS } from './config';
+import { ensureCsrfToken } from './csrf';
 
 interface LoginPageProps {
   onLogin: (user: any) => void;
@@ -16,34 +17,16 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
 
-  // Helper function to get CSRF token
-  const getCookie = (name: string) => {
-    let cookieValue: string | null = null;
-    if (document.cookie && document.cookie !== '') {
-      const cookies = document.cookie.split(';');
-      for (let cookie of cookies) {
-        cookie = cookie.trim();
-        if (cookie.startsWith(name + '=')) {
-          cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
-          break;
-        }
-      }
-    }
-    return cookieValue;
-  };
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
     setError('');
 
     try {
+      const csrfToken = await ensureCsrfToken();
       // Create AbortController for timeout
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 second timeout
-      
-      // Get CSRF token from existing cookies only
-      const csrfToken = getCookie('csrftoken');
 
       const response = await fetch(API_ENDPOINTS.AUTH.LOGIN, {
         method: 'POST',

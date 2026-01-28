@@ -446,10 +446,26 @@ def extract_toc(docx_path):
             # Process Executive Summary itself
             if is_bold:
                 heading_text = clean_heading(text)
-                if heading_text:
-                    # For headings, keep only <strong> tags, remove <b> tags
-                    heading_text = heading_text.replace('<b>', '').replace('</b>', '')
-                    html_output.append(f"\n<strong>{heading_text}</strong>")
+                # If Executive Summary line contains inline bullets (•), split into heading + list
+                if '•' in text:
+                    parts = [p.strip() for p in text.split('•') if p.strip()]
+                    if parts:
+                        # First part as heading (cleaned)
+                        html_output.append(f"\n<strong>{clean_heading(parts[0])}</strong>")
+                        # Remaining parts as bullets
+                        bullets = parts[1:]
+                        if bullets:
+                            html_output.append("<ul>")
+                            for item in bullets:
+                                item_clean = remove_emojis(item).strip()
+                                if item_clean:
+                                    html_output.append(f"<li><p>{item_clean}</p></li>")
+                            html_output.append("</ul>")
+                else:
+                    if heading_text:
+                        # For headings, keep only <strong> tags, remove <b> tags
+                        heading_text = heading_text.replace('<b>', '').replace('</b>', '')
+                        html_output.append(f"\n<strong>{heading_text}</strong>")
             continue
 
         # Only process content after Executive Summary is found
@@ -779,12 +795,41 @@ def extract_toc(docx_path):
                 
                 # Get formatted content
                 formatted_content = runs_to_html_with_links(para.runs)
+                raw_text = text  # keep raw for bullet splitting
                 
                 # Check if this is a list item
                 is_word_list_item = is_list_item(para)
                 has_bullet_chars = any(char in text for char in ['•', '–', '○', '◦', '‣', '▪', '▫', '*', '+'])
-                has_numbering = re.match(r'^\d+[\.\)]', text)
+                has_numbering = re.match(r'^\d+[\.]\)', text) or re.match(r'^\d+[\.)]', text)
                 is_list_item_detected = is_word_list_item or has_bullet_chars or has_numbering
+
+                # Special handling: Bold paragraph that contains heading + inline bullet items (e.g., "Market Share Analysis • ... • ...")
+                # Convert to <strong>Heading</strong> followed by <ul><li>...</li>...</ul>
+                if is_bold and '•' in raw_text:
+                    # Close any open lists first
+                    if inside_list:
+                        for _ in range(list_depth):
+                            html_output.append("</ul>")
+                        inside_list = False
+                        list_depth = 0
+
+                    parts = [p.strip() for p in raw_text.split('•') if p.strip()]
+                    if parts:
+                        # First part is heading
+                        heading_text = clean_heading(parts[0])
+                        if heading_text:
+                            html_output.append(f"\n<strong>{heading_text}</strong>")
+                        # Remaining parts are bullet items
+                        bullets = parts[1:]
+                        if bullets:
+                            html_output.append("<ul>")
+                            for item in bullets:
+                                item_clean = remove_emojis(item).strip()
+                                if item_clean:
+                                    html_output.append(f"<li><p>{item_clean}</p></li>")
+                            html_output.append("</ul>")
+                    # Done handling this paragraph
+                    continue
                 
                 if is_list_item_detected:
                     # Remove bold formatting from list items
@@ -1081,17 +1126,37 @@ def extract_seo_title(docx_path):
     doc = Document(docx_path)
     file_name = os.path.splitext(os.path.basename(docx_path))[0]
     revenue_forecast = ""
+
+    def normalize_label(txt: str) -> str:
+        t = txt.strip().lower()
+        t = re.sub(r"\s+", " ", t)
+        t = t.replace("forecast by", "forecast in")
+        t = t.replace("forecasts in", "forecast in")
+        t = t.replace("forecast (", "forecast in ")
+        t = t.replace(")", "")
+        return t
+
     for table in doc.tables:
+        if not table.rows or not table.rows[0].cells:
+            continue
         headers = [cell.text.strip().lower() for cell in table.rows[0].cells]
         if "report attribute" in headers and "details" in headers:
             attr_idx = headers.index("report attribute")
             details_idx = headers.index("details")
             for row in table.rows[1:]:
-                attr = row.cells[attr_idx].text.strip().lower()
+                attr_raw = row.cells[attr_idx].text.strip()
+                attr = normalize_label(attr_raw)
                 details = row.cells[details_idx].text.strip()
-                if "revenue forecast in 2030" in attr:
-                    revenue_forecast = details.replace("USD", "$").strip()
+                # Match any variant that implies revenue/market size forecast for 2030
+                attr_lower = attr_raw.lower()
+                if (("revenue forecast" in attr and (" 2030" in attr or "forecast in" in attr)) or \
+                   ("revenue forecast" in attr_lower and "2030" in attr_raw)) or \
+                   (("market size forecast" in attr_lower or "market size" in attr_lower) and "2030" in attr_raw):
+                    revenue_forecast = re.sub(r"USD", "$", details, flags=re.I).strip()
                     break
+        if revenue_forecast:
+            break
+
     if revenue_forecast:
         return f"{file_name} Size ({revenue_forecast}) 2030"
     return file_name
@@ -1100,17 +1165,37 @@ def extract_breadcrumb_text(docx_path):
     file_name = os.path.splitext(os.path.basename(docx_path))[0]
     revenue_forecast = ""
     doc = Document(docx_path)
+
+    def normalize_label(txt: str) -> str:
+        t = txt.strip().lower()
+        t = re.sub(r"\s+", " ", t)
+        t = t.replace("forecast by", "forecast in")
+        t = t.replace("forecasts in", "forecast in")
+        t = t.replace("forecast (", "forecast in ")
+        t = t.replace(")", "")
+        return t
+
     for table in doc.tables:
+        if not table.rows or not table.rows[0].cells:
+            continue
         headers = [cell.text.strip().lower() for cell in table.rows[0].cells]
         if "report attribute" in headers and "details" in headers:
             attr_idx = headers.index("report attribute")
             details_idx = headers.index("details")
             for row in table.rows[1:]:
-                attr = row.cells[attr_idx].text.strip().lower()
+                attr_raw = row.cells[attr_idx].text.strip()
+                attr = normalize_label(attr_raw)
                 details = row.cells[details_idx].text.strip()
-                if "revenue forecast in 2030" in attr:
-                    revenue_forecast = details.replace("USD", "$").strip()
+                # Match any variant that implies revenue/market size forecast for 2030
+                attr_lower = attr_raw.lower()
+                if (("revenue forecast" in attr and (" 2030" in attr or "forecast in" in attr)) or \
+                   ("revenue forecast" in attr_lower and "2030" in attr_raw)) or \
+                   (("market size forecast" in attr_lower or "market size" in attr_lower) and "2030" in attr_raw):
+                    revenue_forecast = re.sub(r"USD", "$", details, flags=re.I).strip()
                     break
+        if revenue_forecast:
+            break
+
     if revenue_forecast:
         return f"{file_name} Report 2030"
     return file_name
@@ -1545,26 +1630,45 @@ def extract_title(docx_path: str) -> str:
         
         # Check if this paragraph contains segmentation information
         # Handle "By Treatment Type" or "By Application" (generic application segmentation)
+        # Also handle longer paragraphs that start with "By X, ..." pattern
         if ('by treatment type' in clean_text_lower or 'by application' in clean_text_lower):
             # Exclude "Market Analysis by..." patterns
-            if len(clean_text) < 100 and 'market analysis' not in clean_text_lower:
+            # Allow short headers OR paragraphs that start with "By X" (with or without comma)
+            # Also allow paragraphs that start with "By X" followed by description on same line
+            if ('market analysis' not in clean_text_lower and 
+                (len(clean_text) < 100 or 
+                 clean_text_lower.startswith('by application') or 
+                 clean_text_lower.startswith('by treatment type') or
+                 re.match(r'^by\s+(?:treatment\s+type|application)\s', clean_text_lower))):
                 # This is likely a section header, mark it for extraction
                 segments['treatment'] = clean_text
                 segmentation_found = True
         
         # Handle "By Diagnostic Approach" or "By Diagnostic Technology" or generic "By Type/Product Type/Type of Product"
+        # Also handle longer paragraphs that start with "By X, ..." pattern
         if ('by diagnostic approach' in clean_text_lower or 'by diagnostic technology' in clean_text_lower or 
             'by type' in clean_text_lower or 'by product type' in clean_text_lower or 'by type of product' in clean_text_lower):
             # Exclude "Market Analysis by..." patterns
-            if len(clean_text) < 100 and 'market analysis' not in clean_text_lower:
+            # Allow short headers OR paragraphs that start with "By X" (with or without comma)
+            if ('market analysis' not in clean_text_lower and 
+                (len(clean_text) < 100 or 
+                 clean_text_lower.startswith('by product type') or 
+                 clean_text_lower.startswith('by type') or
+                 clean_text_lower.startswith('by diagnostic') or
+                 re.match(r'^by\s+(?:product\s+)?type\s', clean_text_lower))):
                 # This is likely a section header, mark it for extraction
                 if 'diagnostic' not in segments:  # Only set if not already set by medical-specific pattern
                     segments['diagnostic'] = clean_text
-                segmentation_found = True
+                    segmentation_found = True
         
         if ('by end-user' in clean_text_lower or 'by end user' in clean_text_lower):
             # Exclude "Market Analysis by..." patterns
-            if len(clean_text) < 100 and 'market analysis' not in clean_text_lower:
+            # Allow short headers OR paragraphs that start with "By End User" (with or without comma)
+            if ('market analysis' not in clean_text_lower and 
+                (len(clean_text) < 100 or 
+                 clean_text_lower.startswith('by end user') or 
+                 clean_text_lower.startswith('by end-user') or
+                 re.match(r'^by\s+end[-\s]?user\s', clean_text_lower))):
                 # This is likely a section header, mark it for extraction
                 segments['enduser'] = clean_text
                 segmentation_found = True
@@ -1579,7 +1683,12 @@ def extract_title(docx_path: str) -> str:
         
         if ('by region' in clean_text_lower or 'by geography' in clean_text_lower):
             # Exclude "Market Analysis by..." patterns
-            if len(clean_text) < 100 and 'market analysis' not in clean_text_lower:
+            # Allow short headers OR paragraphs that start with "By Region" (with or without comma)
+            if ('market analysis' not in clean_text_lower and 
+                (len(clean_text) < 100 or 
+                 clean_text_lower.startswith('by region') or 
+                 clean_text_lower.startswith('by geography') or
+                 re.match(r'^by\s+(?:region|geography)\s', clean_text_lower))):
                 # This is likely a section header, mark it for extraction
                 segments['region'] = clean_text
                 segmentation_found = True
@@ -1616,18 +1725,30 @@ def extract_title(docx_path: str) -> str:
             if 'market analysis' in clean_text_lower:
                 continue
                 
-            if (('by diagnostic technology' in clean_text_lower or 'by diagnostic approach' in clean_text_lower or 
-                 'by type' in clean_text_lower or 'by product type' in clean_text_lower or 'by type of product' in clean_text_lower) and len(text) < 100):
-                if 'diagnostic' not in segment_indices:  # Only set if not already set
-                    segment_indices['diagnostic'] = para_idx
-            elif ('by treatment type' in clean_text_lower or 'by application' in clean_text_lower) and len(text) < 100:
-                segment_indices['treatment'] = para_idx
-            elif ('by end-user' in clean_text_lower or 'by end user' in clean_text_lower) and len(text) < 100:
-                segment_indices['enduser'] = para_idx
-            elif 'by distribution channel' in clean_text_lower and len(text) < 100:
-                segment_indices['distribution'] = para_idx
-            elif ('by region' in clean_text_lower or 'by geography' in clean_text_lower) and len(text) < 100:
-                segment_indices['region'] = para_idx
+            # Check for segment headers - also handle longer paragraphs that start with "By X, ..."
+            # Use more flexible matching - check if text starts with "By X" (with optional comma)
+            if ('by diagnostic technology' in clean_text_lower or 'by diagnostic approach' in clean_text_lower or 
+                 'by type' in clean_text_lower or 'by product type' in clean_text_lower or 'by type of product' in clean_text_lower):
+                # Allow short headers OR paragraphs that start with "By X" (even if longer)
+                if len(text) < 100 or clean_text_lower.startswith('by product type') or clean_text_lower.startswith('by type') or clean_text_lower.startswith('by diagnostic') or re.match(r'^by\s+(?:product\s+)?type\s', clean_text_lower):
+                    if 'diagnostic' not in segment_indices:  # Only set if not already set
+                        segment_indices['diagnostic'] = para_idx
+            elif 'by treatment type' in clean_text_lower or 'by application' in clean_text_lower:
+                # Allow short headers OR paragraphs that start with "By X"
+                if len(text) < 100 or clean_text_lower.startswith('by application') or clean_text_lower.startswith('by treatment type') or re.match(r'^by\s+(?:treatment\s+type|application)\s', clean_text_lower):
+                    segment_indices['treatment'] = para_idx
+            elif 'by end-user' in clean_text_lower or 'by end user' in clean_text_lower:
+                # Allow short headers OR paragraphs that start with "By X"
+                if len(text) < 100 or clean_text_lower.startswith('by end user') or clean_text_lower.startswith('by end-user') or re.match(r'^by\s+end[-\s]?user\s', clean_text_lower):
+                    segment_indices['enduser'] = para_idx
+            elif 'by distribution channel' in clean_text_lower:
+                # Allow short headers OR paragraphs that start with "By X"
+                if len(text) < 100 or clean_text_lower.startswith('by distribution channel') or re.match(r'^by\s+distribution\s+channel\s', clean_text_lower):
+                    segment_indices['distribution'] = para_idx
+            elif 'by region' in clean_text_lower or 'by geography' in clean_text_lower:
+                # Allow short headers OR paragraphs that start with "By X"
+                if len(text) < 100 or clean_text_lower.startswith('by region') or clean_text_lower.startswith('by geography') or re.match(r'^by\s+(?:region|geography)\s', clean_text_lower):
+                    segment_indices['region'] = para_idx
         
         # Extract actual values from paragraphs following headers
         # Also search document-wide for certain values that might be mentioned elsewhere
@@ -1637,6 +1758,253 @@ def extract_title(docx_path: str) -> str:
             exclude_phrases = ['market analysis', 'market share', 'this segment', 'this area', 'this region', 'key stakeholders', 'projected share']
             skip_intro = True  # Skip first paragraph which is often introductory
             region_names = ['north america', 'europe', 'asia-pacific', 'latin america', 'middle east', 'africa', 'asia pacific', 'lamea']
+            
+            # Check if the segment header paragraph itself contains values (e.g., "By Product Type, the market is divided into X, Y, Z")
+            # Also check if header is "By X" followed by description on same line
+            header_para = doc.paragraphs[para_idx].text.strip()
+            if header_para and len(header_para) > 20:
+                # Try to extract values from the header paragraph itself
+                # Look for patterns like "divided into X, Y, and Z" or "finds usage in X, Y, Z" or "spans X, Y, Z"
+                # Also check if header starts with "By X" and then has description with values
+                header_lower = header_para.lower()
+                
+                # Check if header paragraph starts with "By X" and has description
+                # Pattern: "By Product Type\nInjectables remain..." or "By Application\nFacial aesthetics..."
+                if re.match(r'^by\s+', header_lower):
+                    # Split by newline - first part is header, rest is description
+                    parts = header_para.split('\n', 1)
+                    if len(parts) > 1:
+                        description = parts[1].strip()
+                        # Extract values from description
+                        header_lower = description.lower()
+                        header_para = description  # Use description for value extraction
+                
+                # Common patterns: "divided into", "finds usage in", "spans", "includes", "comprises", "distributed across"
+                # Also check for "encompassing", "remains", "represents", "are", etc.
+                if any(pattern in header_lower for pattern in ['divided into', 'finds usage in', 'spans', 'includes', 'comprises', 'distributed across', 'usage in', 
+                                                                'encompassing', 'remains', 'represents', 'leading', 'category', 'area']):
+                    # Extract values from the header paragraph
+                    # More specific patterns for different segment types
+                    # Pattern 1: "encompassing X, Y, and Z" (e.g., "encompassing botulinum toxin, dermal fillers, and collagen stimulators")
+                    encompassing_match = re.search(r'encompassing\s+([^.]*?)(?:\.|$)', header_para, re.IGNORECASE)
+                    if encompassing_match:
+                        value_text = encompassing_match.group(1).strip()
+                        value_parts = re.split(r',\s*(?:and\s+)?', value_text)
+                        for part in value_parts:
+                            part = part.strip()
+                            if part:
+                                # Extract main value (before any description)
+                                main_value = re.split(r'\s+(?:remain|represent|are|account|these|treatments)', part, 1)[0].strip()
+                                if main_value and len(main_value) > 2:
+                                    if main_value[0].islower():
+                                        main_value = main_value[0].upper() + main_value[1:]
+                                    if len(main_value) < 100 and main_value.lower() not in ['the', 'market', 'segment']:
+                                        main_value = re.sub(r'^(the|a|an)\s+', '', main_value, flags=re.I).strip()
+                                        if main_value:
+                                            values.append(main_value)
+                    
+                    # Pattern 1b: "divided into X, Y, and Z" or "divided into X, Y, Z" or "broadly divided into"
+                    divided_match = re.search(r'(?:broadly\s+)?divided into\s+([^.]*?)(?:\.|$)', header_para, re.IGNORECASE)
+                    if divided_match:
+                        value_text = divided_match.group(1).strip()
+                        # Split by comma and handle "and" before last item
+                        # Handle "X, Y, and Z" pattern
+                        value_parts = re.split(r',\s*(?:and\s+)?', value_text)
+                        for part in value_parts:
+                            part = part.strip()
+                            # Extract just the main value (before any description)
+                            # Handle cases like "pumps, oxygenators" or "pumps and oxygenators"
+                            if part:
+                                # Remove any trailing description
+                                main_value = re.split(r'\s+(?:together|represent|are|is|expected|projected|because|due|gaining)', part, 1)[0].strip()
+                                if main_value and len(main_value) > 2:
+                                    # Capitalize first letter if lowercase (for common nouns like "pumps", "oxygenators")
+                                    if main_value[0].islower():
+                                        # Title case for multi-word phrases
+                                        main_value = main_value.title()
+                                        # Fix common issues: "And" -> "and", "To" -> "to", "Of" -> "of" (but not in abbreviations like "ECMO")
+                                        if 'ecmo' not in main_value.lower():
+                                            main_value = re.sub(r'\b(And|To|Of|In|For|With|The)\b', lambda m: m.group(1).lower(), main_value)
+                                        # But keep first word and acronyms capitalized
+                                        if main_value:
+                                            main_value = main_value[0].upper() + main_value[1:]
+                                            # Ensure acronyms like "ECMO" are uppercase
+                                            main_value = re.sub(r'\b(ECMO|ECLS|ARDS|MSU|ASCs|ELISA|CLIA|IHC|NGS)\b', lambda m: m.group(1).upper(), main_value, flags=re.I)
+                                    if len(main_value) < 100 and main_value.lower() not in ['the', 'market', 'segment']:
+                                        # Clean up common prefixes
+                                        main_value = re.sub(r'^(the|a|an)\s+', '', main_value, flags=re.I).strip()
+                                        if main_value:
+                                            values.append(main_value)
+                    
+                    # Pattern 2a: "represents the dominant application area" -> extract from sentence
+                    # Pattern: "X represents..." or "X remains..." where X is the value
+                    if 'represents' in header_lower or 'remains' in header_lower:
+                        # Extract first capitalized phrase (the value)
+                        # Handle "Facial aesthetics represents..." or "Injectables remain..."
+                        first_cap_match = re.search(r'^([A-Z][a-z]+(?:\s+[a-z]+)*)', header_para)
+                        if first_cap_match:
+                            first_value = first_cap_match.group(1).strip()
+                            # Remove any trailing words before "represents" or "remains"
+                            first_value = re.split(r'\s+(?:represents|remains|is|are|account)', first_value, 1)[0].strip()
+                            # Title case for multi-word
+                            if first_value and len(first_value) < 50 and first_value.lower() not in ['the', 'by', 'market']:
+                                # Capitalize if needed
+                                if first_value[0].islower():
+                                    first_value = first_value.title()
+                                values.append(first_value)
+                    
+                    # Pattern 2b: "leading service providers" -> extract values
+                    # Pattern: "X, Y, and Z are the leading..."
+                    leading_match = re.search(r'^([^.]+?)\s+(?:are|is)\s+the\s+(?:leading|dominant)', header_para, re.IGNORECASE)
+                    if leading_match:
+                        value_text = leading_match.group(1).strip()
+                        value_parts = re.split(r',\s*(?:and\s+)?', value_text)
+                        for part in value_parts:
+                            part = part.strip()
+                            if part and len(part) > 3 and part[0].isupper():
+                                if len(part) < 80:
+                                    values.append(part)
+                    
+                    # Pattern 2c: "finds usage in X, Y, Z" or "finds usage in X, Y, and Z"
+                    usage_match = re.search(r'finds usage in\s+([^.]*?)(?:\.|$)', header_para, re.IGNORECASE)
+                    if usage_match:
+                        value_text = usage_match.group(1).strip()
+                        # Extract values, handling parentheses like "(ARDS)"
+                        # Split by comma, but handle "and" before last item
+                        value_parts = re.split(r',\s*(?:and\s+)?', value_text)
+                        for part in value_parts:
+                            part = part.strip()
+                            if part:
+                                # Extract main value (may include parentheses for abbreviations)
+                                # Keep the full value including parentheses for abbreviations
+                                if '(' in part and ')' in part:
+                                    # Extract the part before parentheses
+                                    main_value = part.split('(')[0].strip()
+                                    # Check if it's a valid abbreviation pattern
+                                    abbrev_match = re.search(r'\(([A-Z]+)\)', part)
+                                    if abbrev_match and len(abbrev_match.group(1)) >= 3:
+                                        # Keep with abbreviation
+                                        main_value = part
+                                else:
+                                    main_value = part
+                                # Remove trailing description
+                                main_value = re.split(r'\s+(?:is|are|projected|expected|account|driven|given)', main_value, 1)[0].strip()
+                                if main_value and len(main_value) > 3:
+                                    # Capitalize first letter if lowercase
+                                    if main_value[0].islower():
+                                        # Title case for multi-word phrases
+                                        main_value = main_value.title()
+                                    # If it has parentheses, keep the abbreviation part
+                                    if '(' in main_value and ')' in main_value:
+                                        # Extract abbreviation and capitalize the main part
+                                        abbrev_match = re.search(r'\(([A-Za-z]+)\)', main_value)
+                                        if abbrev_match:
+                                            main_part = main_value.split('(')[0].strip()
+                                            abbrev = abbrev_match.group(1).upper()  # Uppercase abbreviation
+                                            # Title case the main part, but handle multi-word properly
+                                            main_part = main_part.title()
+                                            # Fix common issues: "And" -> "and", "To" -> "to", "Of" -> "of"
+                                            # But keep "To" in phrases like "Bridge-to-Lung" as lowercase
+                                            main_part = re.sub(r'\b(And|To|Of|In|For|With|The)\b', lambda m: m.group(1).lower(), main_part)
+                                            # Fix hyphenated phrases: "Bridge-To-Lung" -> "Bridge-to-Lung" or "Trauma-Induced" -> "Trauma-Induced" (keep "Induced" capitalized)
+                                            # Handle "Bridge-To-Lung" pattern
+                                            main_part = re.sub(r'([A-Z][a-z]+)-To-([A-Z][a-z]+)', r'\1-to-\2', main_part)
+                                            # Handle "Bridge-to-Lung" already correct
+                                            main_part = re.sub(r'([A-Z][a-z]+)-to-([A-Z][a-z]+)', r'\1-to-\2', main_part)
+                                            # But keep first word capitalized
+                                            if main_part:
+                                                main_part = main_part[0].upper() + main_part[1:]
+                                            main_value = f"{main_part} ({abbrev})"
+                                    if len(main_value) < 100:  # Increased limit for longer values
+                                        values.append(main_value)
+                    
+                    # Pattern 3: "spans X, Y, Z" or "spans X, Y, and Z" or "adoption spans X, Y, Z"
+                    spans_match = re.search(r'(?:adoption\s+)?spans\s+([^.]*?)(?:\.|$)', header_para, re.IGNORECASE)
+                    if spans_match:
+                        value_text = spans_match.group(1).strip()
+                        value_parts = re.split(r',\s*(?:and\s+)?', value_text)
+                        for part in value_parts:
+                            part = part.strip()
+                            if part:
+                                # Remove trailing description
+                                main_value = re.split(r'\s+(?:given|dominate|show|large|tertiary)', part, 1)[0].strip()
+                                if main_value and len(main_value) > 3:
+                                    # Capitalize first letter if lowercase - title case for multi-word
+                                    if main_value[0].islower():
+                                        main_value = main_value.title()
+                                        # Fix common issues: "And" -> "and", "To" -> "to", "Of" -> "of"
+                                        main_value = re.sub(r'\b(And|To|Of|In|For|With|The)\b', lambda m: m.group(1).lower(), main_value)
+                                        # Fix hyphenated phrases: "Bridge-To-Lung" -> "Bridge-to-Lung"
+                                        main_value = re.sub(r'([A-Z][a-z]+)-To-([A-Z][a-z]+)', r'\1-to-\2', main_value)
+                                        main_value = re.sub(r'([A-Z][a-z]+)-to-([A-Z][a-z]+)', r'\1-to-\2', main_value)
+                                        # But keep first word capitalized
+                                        if main_value:
+                                            main_value = main_value[0].upper() + main_value[1:]
+                                    if len(main_value) < 100:  # Increased limit
+                                        values.append(main_value)
+                    
+                    # Pattern 4a: For region segment - "North America represents the largest market..."
+                    if section_type == 'region' and 'represents' in header_lower:
+                        # Extract first capitalized phrase (region name)
+                        region_match = re.search(r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', header_para)
+                        if region_match:
+                            region_value = region_match.group(1).strip()
+                            # Remove trailing words before "represents"
+                            region_value = re.split(r'\s+(?:represents|is|remains|follows|supported)', region_value, 1)[0].strip()
+                            if region_value and len(region_value) < 50 and region_value.lower() not in ['the', 'by', 'market']:
+                                # Title case
+                                if region_value[0].islower():
+                                    region_value = region_value.title()
+                                if region_value not in values:
+                                    values.append(region_value)
+                    
+                    # Pattern 4: "distributed across X, Y, Z"
+                    distributed_match = re.search(r'distributed across\s+([^.]*?)(?:\.|$)', header_para, re.IGNORECASE)
+                    if distributed_match:
+                        value_text = distributed_match.group(1).strip()
+                        # Handle "X, Y, and Z (LAMEA)" pattern
+                        value_parts = re.split(r',\s*(?:and\s+)?(?!\s*\([A-Z]+\))', value_text)
+                        for part in value_parts:
+                            part = part.strip()
+                            if part:
+                                # Remove parentheses like "(LAMEA)"
+                                main_value = re.sub(r'\s*\([^)]+\)', '', part).strip()
+                                if main_value and len(main_value) > 3:
+                                    # Capitalize first letter if lowercase
+                                    if main_value[0].islower():
+                                        main_value = main_value[0].upper() + main_value[1:]
+                                    if len(main_value) < 80:
+                                        values.append(main_value)
+                    
+                    # If we found values in header, use them and continue
+                    if values:
+                        # Continue to check following paragraphs for additional values
+                        pass
+            
+            # Also check if header paragraph has values in the same paragraph (after newline)
+            # Pattern: "By Product Type\nValue1, Value2, Value3" or "By Product Type\nValue1\nValue2"
+            if header_para and '\n' in header_para:
+                header_lines = header_para.split('\n')
+                if len(header_lines) > 1:
+                    # Check lines after the header
+                    for line in header_lines[1:]:
+                        line = line.strip()
+                        if line and len(line) > 10:
+                            # Look for comma-separated values
+                            if ',' in line:
+                                # Extract values from comma-separated list
+                                line_values = re.split(r',\s*(?:and\s+)?', line)
+                                for val in line_values:
+                                    val = val.strip()
+                                    # Extract first part before description words
+                                    val = re.split(r'\s+(?:remain|are|encompass|represent|account|drive|continue|include|comprise)', val, 1, flags=re.I)[0].strip()
+                                    if val and len(val) > 3 and val[0].isupper():
+                                        if len(val) < 80:
+                                            # Capitalize properly
+                                            if val[0].islower():
+                                                val = val[0].upper() + val[1:]
+                                            if val not in values:
+                                                values.append(val)
             
             for i in range(para_idx + 1, min(para_idx + max_paras + 1, len(doc.paragraphs))):
                 text = doc.paragraphs[i].text.strip()
@@ -1654,6 +2022,26 @@ def extract_title(docx_path: str) -> str:
                 # Handle paragraphs that might contain newlines - extract first line as potential heading
                 # Split by newline and check first line
                 first_line = text.split('\n')[0].strip() if '\n' in text else text
+                
+                # Also check if first line contains comma-separated values (might be list of segment values)
+                if ',' in first_line and len(first_line) < 200:
+                    # Try to extract values from comma-separated list at start of paragraph
+                    # Pattern: "Value1, Value2, and Value3 represent..." or "Value1, Value2, Value3"
+                    value_match = re.match(r'^([A-Z][^,]+(?:,\s*[A-Z][^,]+){0,5}(?:,\s*and\s+[A-Z][^,]+)?)', first_line)
+                    if value_match:
+                        value_text = value_match.group(1).strip()
+                        # Remove trailing "and" if present
+                        value_text = re.sub(r',\s*and\s+([A-Z][^,]+)', r', \1', value_text)
+                        value_parts = re.split(r',\s*', value_text)
+                        for val in value_parts:
+                            val = val.strip()
+                            # Extract before description words
+                            val = re.split(r'\s+(?:remain|are|encompass|represent|account|drive|continue|include|comprise)', val, 1, flags=re.I)[0].strip()
+                            if val and len(val) > 3 and val[0].isupper():
+                                if len(val) < 80:
+                                    if val not in values:
+                                        values.append(val)
+                
                 text = first_line  # Use first line for extraction
                 
                 text_lower = text.lower()
@@ -2035,14 +2423,29 @@ def extract_title(docx_path: str) -> str:
                         break
         
         # If abbreviation is already in the name (from filename), don't add it again
+        # Also check if abbreviation is different from what's already in filename
         if preserved_abbrev and abbreviation:
             # Check if they match (case-insensitive)
             if preserved_abbrev.lower() == abbreviation.lower():
                 abbreviation = None  # Don't add duplicate
+            # Also check if abbreviation is already mentioned in the base_market_name
+            elif abbreviation.lower() in base_market_name.lower():
+                abbreviation = None  # Don't add if already present
         
         # Add abbreviation after disease name but before other words if found
         # Check if abbreviation is already in the base_market_name (from filename)
         abbrev_in_name = abbreviation and abbreviation.lower() in base_market_name.lower()
+        # Also check if base_market_name already has an abbreviation (from filename) - don't add duplicate
+        if preserved_abbrev:
+            # If filename already has an abbreviation (like "(VV ECLS)"), don't add another one (like "(ECMO)")
+            # Only exception: G-CSF format where we need to rearrange
+            abbrev_in_name = True
+            # Reset abbreviation to None to prevent adding duplicate
+            abbreviation = None
+        elif abbreviation and abbreviation.lower() in base_market_name.lower():
+            # If abbreviation is already in base_market_name, don't add it
+            abbrev_in_name = True
+            abbreviation = None
         if abbreviation and not abbrev_in_name:
             # Insert after the disease name (before "Diagnostics" or "Market")
             # Pattern: "Acute Myeloid Leukemia (AML) Diagnostics Market"
@@ -2089,46 +2492,46 @@ def extract_title(docx_path: str) -> str:
                     if is_medical:
                         # Medical-specific mapping
                         expected_order = ['Molecular Diagnostics', 'Flow Cytometry', 'NGS', 'Liquid Biopsy', 'IHC', 'Others']
-                        for val in diagnostic_values:
-                            val_lower = val.lower()
-                            if 'molecular diagnostics' in val_lower and 'Molecular Diagnostics' not in cleaned_values:
-                                cleaned_values.append('Molecular Diagnostics')
-                            if 'flow cytometry' in val_lower and 'Flow Cytometry' not in cleaned_values:
-                                cleaned_values.append('Flow Cytometry')
-                            if ('ngs' in val_lower or 'next generation sequencing' in val_lower or 'next-gen sequencing' in val_lower) and 'NGS' not in cleaned_values:
-                                cleaned_values.append('NGS')
-                            if 'liquid biopsy' in val_lower and 'Liquid Biopsy' not in cleaned_values:
-                                cleaned_values.append('Liquid Biopsy')
-                            if ('immunohistochemistry' in val_lower or ('ihc' in val_lower and val_lower != 'others')) and 'IHC' not in cleaned_values:
-                                cleaned_values.append('IHC')
-                            if ('others' in val_lower or val == 'Others') and 'Others' not in cleaned_values:
-                                cleaned_values.append('Others')
-                        
+                    for val in diagnostic_values:
+                        val_lower = val.lower()
+                        if 'molecular diagnostics' in val_lower and 'Molecular Diagnostics' not in cleaned_values:
+                            cleaned_values.append('Molecular Diagnostics')
+                        if 'flow cytometry' in val_lower and 'Flow Cytometry' not in cleaned_values:
+                            cleaned_values.append('Flow Cytometry')
+                        if ('ngs' in val_lower or 'next generation sequencing' in val_lower or 'next-gen sequencing' in val_lower) and 'NGS' not in cleaned_values:
+                            cleaned_values.append('NGS')
+                        if 'liquid biopsy' in val_lower and 'Liquid Biopsy' not in cleaned_values:
+                            cleaned_values.append('Liquid Biopsy')
+                        if ('immunohistochemistry' in val_lower or ('ihc' in val_lower and val_lower != 'others')) and 'IHC' not in cleaned_values:
+                            cleaned_values.append('IHC')
+                        if ('others' in val_lower or val == 'Others') and 'Others' not in cleaned_values:
+                            cleaned_values.append('Others')
+                    
                         # Also search document-wide for NGS and Liquid Biopsy if not found
-                        if 'NGS' not in cleaned_values:
-                            for para in doc.paragraphs:
-                                text_lower = para.text.lower()
-                                if ('ngs' in text_lower or 'next generation sequencing' in text_lower) and 'diagnostic' in text_lower[:100]:
-                                    cleaned_values.append('NGS')
-                                    break
-                        if 'Liquid Biopsy' not in cleaned_values:
-                            for para in doc.paragraphs:
-                                text_lower = para.text.lower()
-                                if 'liquid biopsy' in text_lower and 'diagnostic' in text_lower[:100]:
-                                    cleaned_values.append('Liquid Biopsy')
-                                    break
-                        
+                    if 'NGS' not in cleaned_values:
+                        for para in doc.paragraphs:
+                            text_lower = para.text.lower()
+                            if ('ngs' in text_lower or 'next generation sequencing' in text_lower) and 'diagnostic' in text_lower[:100]:
+                                cleaned_values.append('NGS')
+                                break
+                    if 'Liquid Biopsy' not in cleaned_values:
+                        for para in doc.paragraphs:
+                            text_lower = para.text.lower()
+                            if 'liquid biopsy' in text_lower and 'diagnostic' in text_lower[:100]:
+                                cleaned_values.append('Liquid Biopsy')
+                                break
+                    
                         # Use "By Technology" for medical markets
-                        if cleaned_values:
-                            ordered_values = []
-                            preferred_order = ['Molecular Diagnostics', 'Flow Cytometry', 'NGS', 'Liquid Biopsy', 'IHC', 'Others']
-                            for preferred in preferred_order:
-                                if preferred in cleaned_values:
-                                    ordered_values.append(preferred)
-                            for val in cleaned_values:
-                                if val not in ordered_values:
-                                    ordered_values.append(val)
-                            title_parts.append(f"By Technology ({', '.join(ordered_values[:6])})")
+                    if cleaned_values:
+                        ordered_values = []
+                        preferred_order = ['Molecular Diagnostics', 'Flow Cytometry', 'NGS', 'Liquid Biopsy', 'IHC', 'Others']
+                        for preferred in preferred_order:
+                            if preferred in cleaned_values:
+                                ordered_values.append(preferred)
+                        for val in cleaned_values:
+                            if val not in ordered_values:
+                                ordered_values.append(val)
+                        title_parts.append(f"By Technology ({', '.join(ordered_values[:6])})")
                     elif is_generic_type:
                         # Generic type segmentation - clean up values
                         cleaned_values = []
@@ -2198,6 +2601,10 @@ def extract_title(docx_path: str) -> str:
                                 cleaned_values.append('Chronic Neutropenia')
                         elif val not in cleaned_values:
                             # For generic markets, preserve as-is but clean up
+                            # Fix specific capitalization issues
+                            # Fix "Bridge-To-Lung" -> "Bridge-to-Lung"
+                            if 'bridge' in val_lower and 'lung' in val_lower:
+                                val = re.sub(r'Bridge-To-Lung', 'Bridge-to-Lung', val, flags=re.I)
                             # Map "Other Applications" to "Industrial" if needed
                             if 'other' in val_lower and 'industrial' in val_lower:
                                 if 'Industrial' not in cleaned_values:
@@ -2289,12 +2696,17 @@ def extract_title(docx_path: str) -> str:
                                 ordered_enduser.append(val)
                         cleaned_values = ordered_enduser
                     
-                    # Use "by End-User" for G-CSF, "By End-User Industry" for others
+                    # Use "by End-User" for G-CSF, "By End User" for others (remove "Industry")
                     if cleaned_values:
                         if 'g-csf' in base_market_name.lower():
                             title_parts.append(f"by End-User ({', '.join(cleaned_values[:6])})")
                         else:
-                            title_parts.append(f"By End-User Industry ({', '.join(cleaned_values[:6])})")
+                            # Check if segment text says "By End User" (without Industry)
+                            segment_text = segments.get('enduser', '').lower()
+                            if 'industry' not in segment_text:
+                                title_parts.append(f"By End User ({', '.join(cleaned_values[:6])})")
+                            else:
+                                title_parts.append(f"By End-User Industry ({', '.join(cleaned_values[:6])})")
         
         # 3.5. Distribution Channel
         if 'distribution' in segments:
@@ -2510,7 +2922,7 @@ def extract_title(docx_path: str) -> str:
                     # Try to extract complete title
                     if 'market' in title_part.lower():
                         return _ensure_filename_start_and_year(clean_text, filename)
-        
+    
         # Priority 4: Look for market name with "Market" keyword (flexible positioning)
         if matching_keywords >= min_keywords_needed and 'market' in text_lower and len(clean_text) < 200:
             # Check if it looks like a title (starts with capital, reasonable length)
@@ -3453,17 +3865,37 @@ def extract_seo_title(docx_path):
     doc = Document(docx_path)
     file_name = os.path.splitext(os.path.basename(docx_path))[0]
     revenue_forecast = ""
+
+    def normalize_label(txt: str) -> str:
+        t = txt.strip().lower()
+        t = re.sub(r"\s+", " ", t)
+        t = t.replace("forecast by", "forecast in")
+        t = t.replace("forecasts in", "forecast in")
+        t = t.replace("forecast (", "forecast in ")
+        t = t.replace(")", "")
+        return t
+
     for table in doc.tables:
+        if not table.rows or not table.rows[0].cells:
+            continue
         headers = [cell.text.strip().lower() for cell in table.rows[0].cells]
         if "report attribute" in headers and "details" in headers:
             attr_idx = headers.index("report attribute")
             details_idx = headers.index("details")
             for row in table.rows[1:]:
-                attr = row.cells[attr_idx].text.strip().lower()
+                attr_raw = row.cells[attr_idx].text.strip()
+                attr = normalize_label(attr_raw)
                 details = row.cells[details_idx].text.strip()
-                if "revenue forecast in 2030" in attr:
-                    revenue_forecast = details.replace("USD", "$").strip()
+                # Match any variant that implies revenue/market size forecast for 2030
+                attr_lower = attr_raw.lower()
+                if (("revenue forecast" in attr and (" 2030" in attr or "forecast in" in attr)) or \
+                   ("revenue forecast" in attr_lower and "2030" in attr_raw)) or \
+                   (("market size forecast" in attr_lower or "market size" in attr_lower) and "2030" in attr_raw):
+                    revenue_forecast = re.sub(r"USD", "$", details, flags=re.I).strip()
                     break
+        if revenue_forecast:
+            break
+
     if revenue_forecast:
         return f"{file_name} Size ({revenue_forecast}) 2030"
     return file_name
@@ -3472,17 +3904,37 @@ def extract_breadcrumb_text(docx_path):
     file_name = os.path.splitext(os.path.basename(docx_path))[0]
     revenue_forecast = ""
     doc = Document(docx_path)
+
+    def normalize_label(txt: str) -> str:
+        t = txt.strip().lower()
+        t = re.sub(r"\s+", " ", t)
+        t = t.replace("forecast by", "forecast in")
+        t = t.replace("forecasts in", "forecast in")
+        t = t.replace("forecast (", "forecast in ")
+        t = t.replace(")", "")
+        return t
+
     for table in doc.tables:
+        if not table.rows or not table.rows[0].cells:
+            continue
         headers = [cell.text.strip().lower() for cell in table.rows[0].cells]
         if "report attribute" in headers and "details" in headers:
             attr_idx = headers.index("report attribute")
             details_idx = headers.index("details")
             for row in table.rows[1:]:
-                attr = row.cells[attr_idx].text.strip().lower()
+                attr_raw = row.cells[attr_idx].text.strip()
+                attr = normalize_label(attr_raw)
                 details = row.cells[details_idx].text.strip()
-                if "revenue forecast in 2030" in attr:
-                    revenue_forecast = details.replace("USD", "$").strip()
+                # Match any variant that implies revenue/market size forecast for 2030
+                attr_lower = attr_raw.lower()
+                if (("revenue forecast" in attr and (" 2030" in attr or "forecast in" in attr)) or \
+                   ("revenue forecast" in attr_lower and "2030" in attr_raw)) or \
+                   (("market size forecast" in attr_lower or "market size" in attr_lower) and "2030" in attr_raw):
+                    revenue_forecast = re.sub(r"USD", "$", details, flags=re.I).strip()
                     break
+        if revenue_forecast:
+            break
+
     if revenue_forecast:
         return f"{file_name} Report 2030"
     return file_name
@@ -3583,5 +4035,5 @@ def merge_description_and_coverage(docx_path):
         merged_html = desc_html + "\n\n" + coverage_html if (desc_html or coverage_html) else ""
         return merged_html
     except Exception as e:
-        return f"ERROR: {e}"
+        return f"ERROR: {e}"      
     return [text[i:i+limit] for i in range(0, len(text), limit)]      

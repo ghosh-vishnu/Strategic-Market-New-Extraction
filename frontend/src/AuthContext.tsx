@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import type { ReactNode } from 'react';
 import { API_ENDPOINTS } from './config';
+import { ensureCsrfToken, getCookie } from './csrf';
 
 interface User {
   id: number;
@@ -32,46 +33,6 @@ interface AuthProviderProps {
   children: ReactNode;
 }
 
-// Helper: Get CSRF token from cookie
-function getCookie(name: string) {
-  let cookieValue: string | null = null;
-  if (document.cookie && document.cookie !== '') {
-    const cookies = document.cookie.split(';');
-    for (let cookie of cookies) {
-      cookie = cookie.trim();
-      if (cookie.startsWith(name + '=')) {
-        cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
-        break;
-      }
-    }
-  }
-  return cookieValue;
-}
-
-// Helper: Get CSRF token from Django
-async function getCSRFToken(): Promise<string> {
-  try {
-    // First try to get CSRF token from existing cookies
-    const existingToken = getCookie('csrftoken');
-    if (existingToken) {
-      return existingToken;
-    }
-    
-    // Only make backend call if no existing token
-    const response = await fetch(API_ENDPOINTS.AUTH.CHECK, {
-      method: 'GET',
-      credentials: 'include',
-    });
-    
-    // Extract CSRF token from response headers or cookies
-    const csrfToken = getCookie('csrftoken');
-    return csrfToken || '';
-  } catch (error) {
-    console.error('Error getting CSRF token:', error);
-    return '';
-  }
-}
-
 export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   const [user, setUser] = useState<User | null>(() => {
     try {
@@ -90,10 +51,14 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
 
   const logout = async () => {
     try {
+      const csrfToken = await ensureCsrfToken();
       // Server-side logout - no CSRF token needed
       const response = await fetch(API_ENDPOINTS.AUTH.LOGOUT, {
         method: 'POST',
         credentials: 'include',  // Important: include cookies
+        headers: {
+          'X-CSRFToken': csrfToken || '',
+        },
       });
       
       if (response.ok) {
@@ -165,6 +130,10 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   };
 
   useEffect(() => {
+    ensureCsrfToken().catch((error) => {
+      console.error('Failed to prefetch CSRF token', error);
+    });
+
     // Only check auth if user is not already in localStorage
     const savedUser = localStorage.getItem('user');
     if (!savedUser) {

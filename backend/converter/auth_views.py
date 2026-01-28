@@ -1,64 +1,60 @@
 from django.contrib.auth import authenticate, login, logout
-from django.contrib.auth.decorators import login_required
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_http_methods
-from django.contrib.auth.models import User
-from rest_framework.decorators import api_view
+from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
 import json
 
+
 @api_view(['POST'])
-@csrf_exempt
+@permission_classes([AllowAny])
+@csrf_protect
 def login_view(request):
     """Login API endpoint"""
-    try:
-        data = json.loads(request.body)
-        email = data.get('email')
-        password = data.get('password')
+    data = request.data or {}
+    email = (data.get('email') or '').strip()
+    password = data.get('password')
 
-     
-        
-        if not email or not password:
-            return Response({
+    if not email or not password:
+        return Response(
+            {
                 'success': False,
                 'message': 'Email and password are required'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Authenticate user
-        user = authenticate(request, username=email, password=password)
-    
-        # return Response({'user': user})
-        
-        if user is not None:
-            login(request, user)
-            return Response({
-                'success': True,
-                'message': 'Login successful',
-                'user': {
-                    'id': user.id,
-                    'email': user.email,
-                    'username': user.username,
-                    'first_name': user.first_name,
-                    'last_name': user.last_name
-                }
-            }, status=status.HTTP_200_OK)
-        else:
-            return Response({
+            },
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    user = authenticate(request, username=email, password=password)
+
+    if user is None:
+        return Response(
+            {
                 'success': False,
                 'message': 'Invalid email or password'
-            }, status=status.HTTP_401_UNAUTHORIZED)
-            
-    except Exception as e:
-        return Response({
-            'success': False,
-            'message': 'Login failed',
-            'error': str(e)
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            },
+            status=status.HTTP_401_UNAUTHORIZED
+        )
+
+    login(request, user)
+    return Response(
+        {
+            'success': True,
+            'message': 'Login successful',
+            'user': {
+                'id': user.id,
+                'email': user.email,
+                'username': user.username,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+            }
+        },
+        status=status.HTTP_200_OK
+    )
 
 @api_view(['POST'])
-@csrf_exempt
+@permission_classes([IsAuthenticated])
+@csrf_protect
 def logout_view(request):
     """Logout API endpoint - Server-side cookie deletion"""
     try:
@@ -100,6 +96,8 @@ def logout_view(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(['GET'])
+@permission_classes([AllowAny])
+@ensure_csrf_cookie
 def check_auth_view(request):
     """Check if user is authenticated"""
     try:

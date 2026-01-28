@@ -3,14 +3,19 @@ from django.shortcuts import render
 # Create your views here.
 import os, uuid, threading, random, re, logging
 from pathlib import Path
+from typing import Set
+from datetime import date
+
+import pandas as pd
 from django.conf import settings
 from django.http import FileResponse, Http404, HttpResponseBadRequest
-from rest_framework.decorators import api_view
-from rest_framework.response import Response
-from datetime import date
-import pandas as pd
+from django.utils.text import get_valid_filename
 from openpyxl import load_workbook
 from openpyxl.styles import Font
+from rest_framework import status
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
 
 
 from converter.utils import extractor
@@ -24,6 +29,50 @@ logger = logging.getLogger(__name__)
 # simple in-memory job tracker
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+
+ALLOWED_DOCUMENT_EXTENSIONS = {'.doc', '.docx', '.rtf', '.odt'}
+
+
+def _register_job_for_session(request, job_id: str) -> None:
+    tracked = request.session.get("converter_jobs", [])
+    if job_id not in tracked:
+        tracked.append(job_id)
+        request.session["converter_jobs"] = tracked
+        request.session.modified = True
+
+
+def _remove_job_from_session(request, job_id: str) -> None:
+    tracked = request.session.get("converter_jobs", [])
+    if job_id in tracked:
+        tracked.remove(job_id)
+        request.session["converter_jobs"] = tracked
+        request.session.modified = True
+
+
+def _job_is_authorized(request, job_id: str) -> bool:
+    tracked = request.session.get("converter_jobs", [])
+    return job_id in tracked
+
+
+def _sanitize_filename(original_name: str, used_names: Set[str]) -> str:
+    base_name = os.path.basename(original_name)
+    base_name = get_valid_filename(base_name)
+
+    if not base_name:
+        base_name = f"document-{uuid.uuid4().hex}.docx"
+
+    name_path = Path(base_name)
+    stem = name_path.stem or "document"
+    suffix = name_path.suffix or ".docx"
+
+    candidate = f"{stem}{suffix}"
+    counter = 1
+    while candidate in used_names:
+        candidate = f"{stem}_{counter}{suffix}"
+        counter += 1
+
+    used_names.add(candidate)
+    return candidate
 
 def _job_dir(job_id: str) -> Path:
     return Path(settings.MEDIA_ROOT) / job_id
@@ -85,6 +134,7 @@ def _cleanup_old_jobs():
 
 # ------------------- Upload API -------------------
 @api_view(['POST'])
+@permission_classes([IsAuthenticated])
 def upload_files(request):
     # Clean up old job folders before starting new upload
     _cleanup_old_jobs()
@@ -93,9 +143,12 @@ def upload_files(request):
     incoming_job_id = request.GET.get("jobId")
 
     if incoming_job_id and incoming_job_id in JOBS:
+        if not _job_is_authorized(request, incoming_job_id):
+            return Response({"detail": "Job not found"}, status=status.HTTP_404_NOT_FOUND)
         job_id = incoming_job_id
         folder = _job_dir(job_id)
         folder.mkdir(parents=True, exist_ok=True)
+        _register_job_for_session(request, job_id)
     else:
         job_id = str(uuid.uuid4())
         folder = _job_dir(job_id)
@@ -109,11 +162,28 @@ def upload_files(request):
             status="pending",
             is_active=True
         )
+        _register_job_for_session(request, job_id)
 
     files = request.FILES.getlist('files')
     if not files:
         return HttpResponseBadRequest("No files uploaded")
 
+    invalid_files = [
+        f.name for f in files
+        if Path(f.name).suffix.lower() not in ALLOWED_DOCUMENT_EXTENSIONS
+    ]
+    if invalid_files:
+        return Response(
+            {
+                "detail": "Unsupported file type(s) detected.",
+                "files": invalid_files,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    existing_names: Set[str] = set()
+    if folder.exists():
+        existing_names.update(os.listdir(folder))
 
     # Extract folder name only when creating a NEW job
     if incoming_job_id is None or incoming_job_id not in JOBS:
@@ -145,7 +215,8 @@ def upload_files(request):
     uploaded_files = []
     for f in files:
         filename = f.name
-        path = folder / filename
+        safe_name = _sanitize_filename(filename, existing_names)
+        path = folder / safe_name
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'wb+') as dest:
             for chunk in f.chunks():
@@ -156,7 +227,7 @@ def upload_files(request):
             job_id=job_id,
             folder_name=folder_name,
             file_path=str(path),
-            file_name=filename,
+            file_name=safe_name,
             file_size=f.size,
             upload_date=timezone.now(),
             conversion_complete=False,
@@ -409,10 +480,13 @@ def _convert_worker(job_id: str):
 
 
 @api_view(['POST'])
+@permission_classes([IsAuthenticated])
 def reset_job(request):
     """Cancel a running job and delete its files. If jobId missing, clear all jobs."""
     job_id = request.GET.get("jobId")
     if job_id:
+        if not _job_is_authorized(request, job_id):
+            return Response({"reset": False, "detail": "Job not found"}, status=status.HTTP_404_NOT_FOUND)
         # Clean up database records first (in case job was already deleted from memory)
         try:
             # Delete uploaded files
@@ -439,6 +513,8 @@ def reset_job(request):
         except KeyError:
             # Job was already removed from memory
             logger.info(f"Job {job_id} was already removed from memory")
+
+        _remove_job_from_session(request, job_id)
         
         return Response({"reset": True, "jobId": job_id})
     # No jobId: clear all
@@ -453,14 +529,19 @@ def reset_job(request):
         except KeyError:
             # Job was already removed by another thread/process
             logger.info(f"Job {jid} was already removed during clear all")
+    request.session["converter_jobs"] = []
+    request.session.modified = True
     return Response({"reset": True, "all": True})
 
 # ------------------- Start Conversion -------------------
 @api_view(['POST'])
+@permission_classes([IsAuthenticated])
 def start_convert(request):
     job_id = request.GET.get("jobId")
     if not job_id or job_id not in JOBS:
-        return HttpResponseBadRequest("Invalid jobId")
+        return Response({"detail": "Invalid jobId"}, status=status.HTTP_400_BAD_REQUEST)
+    if not _job_is_authorized(request, job_id):
+        return Response({"detail": "Job not found"}, status=status.HTTP_404_NOT_FOUND)
 
     # Update job status in database to "converting"
     try:
@@ -477,13 +558,28 @@ def start_convert(request):
 
 # ------------------- Progress -------------------
 @api_view(['GET'])
+@permission_classes([IsAuthenticated])
 def progress(request):
     job_id = request.GET.get("jobId")
-    if not job_id or job_id not in JOBS:
+    if not job_id:
+        return Response({"error": "Job not found", "progress": 0, "done": False}, status=404)
+
+    job_data = JOBS.get(job_id)
+    if not job_data or not _job_is_authorized(request, job_id):
+        job_record = JobRecord.objects.filter(job_id=job_id).first()
+        if job_record:
+            return Response(
+                {
+                    "progress": job_record.progress or 0,
+                    "done": job_record.status == "completed",
+                    "error": "Job state was reset. Please restart the conversion.",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
         return Response({"error": "Job not found", "progress": 0, "done": False}, status=404)
     
-    job_data = JOBS[job_id]
-    
+    job_data = job_data
+
     # Check if job has an error
     if job_data.get("error"):
         return Response({
@@ -504,6 +600,7 @@ def progress(request):
 
 # ------------------- Extract Excel Upload -------------------
 @api_view(['POST'])
+@permission_classes([IsAuthenticated])
 def upload_extract_excel(request):
     """Upload Extract Excel sheet"""
     try:
@@ -517,6 +614,8 @@ def upload_extract_excel(request):
         if not job_id or job_id not in JOBS:
             logger.info(f"DEBUG: Invalid jobId: {job_id}, Available jobs: {list(JOBS.keys())}")
             return Response({"success": False, "message": "Invalid jobId"}, status=400)
+        if not _job_is_authorized(request, job_id):
+            return Response({"success": False, "message": "Job not found"}, status=404)
         
         excel_file = request.FILES.get("excelFile")
         logger.info(f"DEBUG: Excel file: {excel_file}")
@@ -595,6 +694,7 @@ def upload_extract_excel(request):
 
 # ------------------- Direct Excel Upload (Skip Word Conversion) -------------------
 @api_view(['POST'])
+@permission_classes([IsAuthenticated])
 def upload_direct_excel(request):
     """Upload converted Excel file directly (skip Word conversion step)"""
     try:
@@ -606,6 +706,7 @@ def upload_direct_excel(request):
         job_id = str(uuid.uuid4())
         job_dir = _job_dir(job_id)
         job_dir.mkdir(parents=True, exist_ok=True)
+        _register_job_for_session(request, job_id)
         
         excel_file = request.FILES.get("excelFile")
         logger.info(f"DEBUG: Excel file: {excel_file}")
@@ -700,6 +801,7 @@ def upload_direct_excel(request):
 
 # ------------------- Excel Upload -------------------
 @api_view(['POST'])
+@permission_classes([IsAuthenticated])
 def upload_excel_sheet(request):
     """Upload Excel sheet with Title, Category, Subcategory columns"""
     try:
@@ -713,6 +815,8 @@ def upload_excel_sheet(request):
         if not job_id or job_id not in JOBS:
             logger.info(f"DEBUG: Invalid jobId: {job_id}, Available jobs: {list(JOBS.keys())}")
             return Response({"success": False, "message": "Invalid jobId"}, status=400)
+        if not _job_is_authorized(request, job_id):
+            return Response({"success": False, "message": "Job not found"}, status=404)
         
         excel_file = request.FILES.get("excelFile")
         logger.info(f"DEBUG: Excel file: {excel_file}")
@@ -822,12 +926,15 @@ def upload_excel_sheet(request):
 
 # ------------------- Apply Excel Mapping -------------------
 @api_view(['POST'])
+@permission_classes([IsAuthenticated])
 def apply_excel_mapping(request):
     """Apply Excel mapping to the converted Word files"""
     try:
         job_id = request.POST.get("jobId")
         if not job_id or job_id not in JOBS:
             return Response({"success": False, "message": "Invalid jobId"}, status=400)
+        if not _job_is_authorized(request, job_id):
+            return Response({"success": False, "message": "Job not found"}, status=404)
         
         # Check if either mapping Excel is uploaded OR direct Excel is uploaded
         if not JOBS[job_id].get('excel_uploaded', False) and not JOBS[job_id].get('excel_path'):
@@ -1220,9 +1327,12 @@ def apply_excel_mapping(request):
 
 # ------------------- Result download -------------------
 @api_view(['GET'])
+@permission_classes([IsAuthenticated])
 def result_file(request):
     job_id = request.GET.get("jobId")
     if not job_id or job_id not in JOBS:
+        raise Http404("job not found")
+    if not _job_is_authorized(request, job_id):
         raise Http404("job not found")
 
     fmt = request.GET.get("format", "xlsx").lower()
@@ -1286,6 +1396,7 @@ def result_file(request):
     if fmt == "csv":
         filename = f"{folder_name}_mapped.csv"
         logger.info(f"DEBUG: Downloading CSV file as: {filename}")  # Debug log
+        _remove_job_from_session(request, job_id)
         return FileResponse(open(path, "rb"), as_attachment=True, filename=filename, content_type="text/csv")
     else:
         # Check if Excel mapping was applied
@@ -1303,5 +1414,6 @@ def result_file(request):
         else:
             clean_filename = f"{folder_name}.xlsx"
         
+        _remove_job_from_session(request, job_id)
         return FileResponse(open(path, "rb"), as_attachment=True, filename=clean_filename,
                             content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
