@@ -61,14 +61,20 @@ def remove_emojis(text: str) -> str:
 # ------------------- Normalization ------------------- 
 def _norm(s: str) -> str:
     s = remove_emojis(s or "")
+    # Normalize common dash/encoding issues in DOCX text.
+    # Some generated documents contain U+FFFD (�) where an en-dash (–) should be.
+    s = s.replace("\uFFFD", DASH)  # � -> –
+    s = s.replace("\u2014", DASH)  # em-dash -> en-dash
     return re.sub(r"\s+", " ", s.strip())
 
 def _inline_title(text: str) -> str:
     m = re.split(r"[:\-–]", text, maxsplit=1)
     if len(m) > 1:
         right = m[1].strip()
-        if right and not re.match(r'^\s*(?:[A-Za-z]\.)?(?:\d+(?:\.\d+)*)?[\.\)]?\s*(?:report\s*title|full\s*title|full\s*report\s*title|title\s*\(long[-\s]*form\))[\s:–-]*$', right):
-            return right
+        if right and not re.match(r'^\s*(?:[A-Za-z]\.)?(?:\d+(?:\.\d+)*)?[\.\)]?\s*(?:report\s*title|full\s*title|full\s*report\s*title|title\s*\(long[-\s]*form\))[\s:–-]*$', right, re.I):
+            # Reject fragments from splitting on hyphen in "Long-Form" (e.g. "Form)")
+            if len(right) >= 25 and ("market" in right.lower() or " by " in right.lower() or "segment revenue" in right.lower()):
+                return right
     return ""
 
 def _year_range_present(text: str) -> bool:
@@ -1431,10 +1437,77 @@ HEADER_LINE_RE = re.compile(
         (?:[A-Za-z]\.)?
         (?:\d+(?:\.\d+)*)?
         [\.\)]?\s*
-        (?:report\s*title|full\s*title|full\s*report\s*title|title\s*\(long[-\s]*form\))
+        (?:report\s*title(?:\s*\(long[-–\s]*form\))?|full\s*title|full\s*report\s*title|title\s*\(long[-–\s]*form\))
         [\s:–-]*$
     """, re.I | re.X
 )
+
+
+def _is_section_heading_title(title: str) -> bool:
+    """Reject section headings like 'X Market: Market Segmentation and Forecast Scope'."""
+    if not title or len(title) < 10:
+        return False
+    low = (title or "").lower()
+    if "market segmentation" in low and "forecast scope" in low:
+        return True
+    if re.search(r"market\s*:\s*market\s+segmentation", low):
+        return True
+    return False
+
+REPORT_TITLE_INLINE_RE = re.compile(
+    r"""^\s*
+        (?:[A-Za-z]\.)?
+        (?:\d+(?:\.\d+)*)?
+        [\.\)]?\s*
+        (?:
+            report\s*title(?:\s*\(long[-–\s]*form\))?
+          | full\s*title
+          | full\s*report\s*title
+          | title\s*\(long[-–\s]*form\)
+        )
+        \s*[:–-]?\s*
+        (.+?)
+        \s*$
+    """,
+    re.I | re.X,
+)
+
+def _extract_labeled_inline_title(text: str) -> str:
+    """
+    Extract title from lines like:
+      - "A.1. Report Title (Long-Form) Adventure Tourism Market By ... Forecast, 2024–2030"
+      - "Report Title: <title>"
+    """
+    text = _norm(text or "")
+    m = REPORT_TITLE_INLINE_RE.match(text)
+    if not m:
+        return ""
+    candidate = _norm(m.group(1))
+    if not candidate:
+        return ""
+
+    low = candidate.lower()
+    # Be conservative: only accept if it looks like a real long-form title.
+    # Some docs contain lines like "AC Power Source Market (Long-Form)" which are not the full segmented title.
+    by_count = len(re.findall(r"\bby\s+\w", low))
+    has_year_range = bool(re.search(r"20\d{2}\s*[\-–]\s*20\d{2}", candidate))
+    looks_long_form = (
+        ("market" in low)
+        and (
+            "segment revenue estimation" in low
+            or ("forecast" in low and has_year_range)
+            or (by_count >= 2 and has_year_range)
+        )
+    )
+    if not looks_long_form:
+        return ""
+
+    # Trim any trailing text after the first year-range (common in SEO/JSON blocks)
+    yr = re.search(r"20\d{2}\s*[\-–]\s*20\d{2}", candidate)
+    if yr:
+        candidate = candidate[:yr.end()].strip()
+
+    return candidate
 
 def paragraph_to_html(para):
     text = para.text.strip()
@@ -1489,6 +1562,19 @@ def extract_title(docx_path: str) -> str:
     filename_low = filename.lower()
     blocks = [(p, (p.text or "").strip()) for p in doc.paragraphs if (p.text or "").strip()]
 
+    # Priority 0: inline "Report Title (Long-Form) ..." lines
+    for _, text in blocks:
+        inline = _extract_labeled_inline_title(remove_emojis(text))
+        if inline:
+            return _ensure_filename_start_and_year(inline, filename)
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                inline = _extract_labeled_inline_title(remove_emojis(cell.text or ""))
+                if inline:
+                    return _ensure_filename_start_and_year(inline, filename)
+
     capture = False
     for _, text in blocks:
         text = remove_emojis(text)
@@ -1508,12 +1594,15 @@ def extract_title(docx_path: str) -> str:
                 if not cell_text:
                     continue
                 if "report title" in cell_text or "full title" in cell_text or "full report title" in cell_text:
+                    inline = _extract_labeled_inline_title(remove_emojis(cell.text or ""))
+                    if inline:
+                        return _ensure_filename_start_and_year(inline, filename)
                     if c_idx + 1 < len(row.cells):
                         nxt = row.cells[c_idx+1].text.strip()
                         if nxt:
                             return _ensure_filename_start_and_year(nxt, filename)
                     if r_idx + 1 < len(table.rows):
-                        nxt = row.rows[r_idx+1].cells[c_idx].text.strip()
+                        nxt = table.rows[r_idx+1].cells[c_idx].text.strip()
                         if nxt:
                             return _ensure_filename_start_and_year(nxt, filename)
 
@@ -1524,6 +1613,8 @@ def extract_title(docx_path: str) -> str:
             if inline:
                 return _ensure_filename_start_and_year(inline, filename)
         if low.startswith(filename_low) and "forecast" in low:
+            if _is_section_heading_title(text):
+                continue
             return _ensure_filename_start_and_year(text, filename)
 
     # PRIORITY 0: Look for detailed segmented title format
@@ -1628,6 +1719,34 @@ def extract_title(docx_path: str) -> str:
         clean_text = remove_emojis(text)
         clean_text_lower = clean_text.lower()
         
+        # Handle "By Phase Type" (common in power/electrical markets)
+        # Do this before generic "By Type" handling to avoid misclassifying it as product/type.
+        if 'by phase type' in clean_text_lower:
+            if (
+                'market analysis' not in clean_text_lower
+                and (
+                    len(clean_text) < 120
+                    or clean_text_lower.startswith('by phase type')
+                    or re.match(r'^by\s+phase\s+type\s', clean_text_lower)
+                )
+            ):
+                segments['phase'] = clean_text
+                segmentation_found = True
+
+        # Handle "By Output Power" (common in power/electrical markets)
+        if 'by output power' in clean_text_lower or 'by power output' in clean_text_lower:
+            if (
+                'market analysis' not in clean_text_lower
+                and (
+                    len(clean_text) < 140
+                    or clean_text_lower.startswith('by output power')
+                    or clean_text_lower.startswith('by power output')
+                    or re.match(r'^by\s+(?:output\s+power|power\s+output)\s', clean_text_lower)
+                )
+            ):
+                segments['output_power'] = clean_text
+                segmentation_found = True
+
         # Check if this paragraph contains segmentation information
         # Handle "By Treatment Type" or "By Application" (generic application segmentation)
         # Also handle longer paragraphs that start with "By X, ..." pattern
@@ -1647,7 +1766,8 @@ def extract_title(docx_path: str) -> str:
         # Handle "By Diagnostic Approach" or "By Diagnostic Technology" or generic "By Type/Product Type/Type of Product"
         # Also handle longer paragraphs that start with "By X, ..." pattern
         if ('by diagnostic approach' in clean_text_lower or 'by diagnostic technology' in clean_text_lower or 
-            'by type' in clean_text_lower or 'by product type' in clean_text_lower or 'by type of product' in clean_text_lower):
+            ('by type' in clean_text_lower and 'by phase type' not in clean_text_lower) or
+            'by product type' in clean_text_lower or 'by type of product' in clean_text_lower):
             # Exclude "Market Analysis by..." patterns
             # Allow short headers OR paragraphs that start with "By X" (with or without comma)
             if ('market analysis' not in clean_text_lower and 
@@ -1727,8 +1847,14 @@ def extract_title(docx_path: str) -> str:
                 
             # Check for segment headers - also handle longer paragraphs that start with "By X, ..."
             # Use more flexible matching - check if text starts with "By X" (with optional comma)
-            if ('by diagnostic technology' in clean_text_lower or 'by diagnostic approach' in clean_text_lower or 
-                 'by type' in clean_text_lower or 'by product type' in clean_text_lower or 'by type of product' in clean_text_lower):
+            if 'by phase type' in clean_text_lower:
+                if len(text) < 140 or clean_text_lower.startswith('by phase type') or re.match(r'^by\s+phase\s+type\s', clean_text_lower):
+                    segment_indices['phase'] = para_idx
+            elif 'by output power' in clean_text_lower or 'by power output' in clean_text_lower:
+                if len(text) < 160 or clean_text_lower.startswith('by output power') or clean_text_lower.startswith('by power output') or re.match(r'^by\s+(?:output\s+power|power\s+output)\s', clean_text_lower):
+                    segment_indices['output_power'] = para_idx
+            elif ('by diagnostic technology' in clean_text_lower or 'by diagnostic approach' in clean_text_lower or 
+                 ('by type' in clean_text_lower and 'by phase type' not in clean_text_lower) or 'by product type' in clean_text_lower or 'by type of product' in clean_text_lower):
                 # Allow short headers OR paragraphs that start with "By X" (even if longer)
                 if len(text) < 100 or clean_text_lower.startswith('by product type') or clean_text_lower.startswith('by type') or clean_text_lower.startswith('by diagnostic') or re.match(r'^by\s+(?:product\s+)?type\s', clean_text_lower):
                     if 'diagnostic' not in segment_indices:  # Only set if not already set
@@ -1781,8 +1907,24 @@ def extract_title(docx_path: str) -> str:
                 
                 # Common patterns: "divided into", "finds usage in", "spans", "includes", "comprises", "distributed across"
                 # Also check for "encompassing", "remains", "represents", "are", etc.
-                if any(pattern in header_lower for pattern in ['divided into', 'finds usage in', 'spans', 'includes', 'comprises', 'distributed across', 'usage in', 
-                                                                'encompassing', 'remains', 'represents', 'leading', 'category', 'area']):
+                if any(pattern in header_lower for pattern in [
+                    'divided into',
+                    'finds usage in',
+                    'applications across',
+                    'find applications across',
+                    'available across',
+                    'spans',
+                    'includes',
+                    'comprises',
+                    'distributed across',
+                    'usage in',
+                    'encompassing',
+                    'remains',
+                    'represents',
+                    'leading',
+                    'category',
+                    'area',
+                ]):
                     # Extract values from the header paragraph
                     # More specific patterns for different segment types
                     # Pattern 1: "encompassing X, Y, and Z" (e.g., "encompassing botulinum toxin, dermal fillers, and collagen stimulators")
@@ -1917,6 +2059,44 @@ def extract_title(docx_path: str) -> str:
                                             main_value = f"{main_part} ({abbrev})"
                                     if len(main_value) < 100:  # Increased limit for longer values
                                         values.append(main_value)
+
+                    # Pattern 2d: "find applications across X, Y, and Z" / "applications across X, Y, Z"
+                    apps_match = re.search(r'(?:find(?:s)?\s+)?applications\s+across\s+([^.]*?)(?:\.|$)', header_para, re.IGNORECASE)
+                    if apps_match:
+                        value_text = apps_match.group(1).strip()
+                        value_text = re.sub(r'^(?:a\s+wide\s+range\s+of\s+)?', '', value_text, flags=re.I).strip()
+                        value_parts = re.split(r',\s*(?:and\s+)?', value_text)
+                        for part in value_parts:
+                            part = part.strip()
+                            if not part:
+                                continue
+                            main_value = re.split(r'\s+(?:lead|dominat|remain|represent|account|continue|expand)', part, 1, flags=re.I)[0].strip()
+                            if main_value and len(main_value) < 100:
+                                # Title-case common nouns but keep acronyms/ampersands
+                                if main_value[0].islower():
+                                    main_value = main_value.title()
+                                values.append(main_value)
+
+                    # Pattern 2e: "available across a wide spectrum – X, Y, and Z"
+                    avail_match = re.search(
+                        r'available\s+across\s+(?:a\s+wide\s+spectrum\s*)?[–\-]\s*([^.]*?)(?:\.|$)',
+                        header_para,
+                        re.IGNORECASE,
+                    )
+                    if not avail_match:
+                        avail_match = re.search(r'available\s+across\s+([^.]*?)(?:\.|$)', header_para, re.IGNORECASE)
+                    if avail_match:
+                        value_text = avail_match.group(1).strip()
+                        # Strip leading filler like "a wide spectrum –"
+                        value_text = re.sub(r'^(?:a\s+wide\s+spectrum\s*)?[–\-]\s*', '', value_text, flags=re.I).strip()
+                        value_parts = re.split(r',\s*(?:and\s+)?', value_text)
+                        for part in value_parts:
+                            part = part.strip()
+                            if not part:
+                                continue
+                            main_value = re.split(r'\s+(?:serve|serves|remain|represent|account|are|is)\b', part, 1, flags=re.I)[0].strip()
+                            if main_value and len(main_value) < 80:
+                                values.append(main_value)
                     
                     # Pattern 3: "spans X, Y, Z" or "spans X, Y, and Z" or "adoption spans X, Y, Z"
                     spans_match = re.search(r'(?:adoption\s+)?spans\s+([^.]*?)(?:\.|$)', header_para, re.IGNORECASE)
@@ -1976,6 +2156,22 @@ def extract_title(docx_path: str) -> str:
                                     if len(main_value) < 80:
                                         values.append(main_value)
                     
+                    # If we confidently extracted a list from the header, don't keep mining narrative
+                    # paragraphs (avoids picking sentences like "The X segment is expanding quickly").
+                    if values and section_type in {'treatment', 'phase', 'output_power'} and len(values) >= 2:
+                        # De-dupe while preserving order
+                        deduped = []
+                        seen = set()
+                        for v in values:
+                            vv = v.strip()
+                            if not vv:
+                                continue
+                            if vv.lower() in seen:
+                                continue
+                            seen.add(vv.lower())
+                            deduped.append(vv)
+                        return deduped[:8]
+
                     # If we found values in header, use them and continue
                     if values:
                         # Continue to check following paragraphs for additional values
@@ -2473,8 +2669,43 @@ def extract_title(docx_path: str) -> str:
         # Build the detailed title
         title_parts = [base_market_name]
         
-        # Build title parts in specific order: Product Type, Distribution Channel, Application, End-User, Geography
+        # Build title parts in specific order: Phase Type, Output Power, Product Type, Distribution Channel, Application, End-User, Geography
         # Note: Order matters for consistency
+
+        # 0. Phase Type (for power/electrical markets)
+        if 'phase' in segments and 'phase' in segment_indices:
+            phase_values = extract_segment_values(segment_indices['phase'], 'phase')
+            if phase_values:
+                cleaned_values = []
+                for val in phase_values:
+                    v = val.strip()
+                    if not v:
+                        continue
+                    # normalize capitalization for common values
+                    if v.lower() == 'single phase':
+                        v = 'Single Phase'
+                    elif v.lower() == 'three phase':
+                        v = 'Three Phase'
+                    if v not in cleaned_values:
+                        cleaned_values.append(v)
+                if cleaned_values:
+                    title_parts.append(f"By Phase Type ({', '.join(cleaned_values[:6])})")
+
+        # 0.5 Output Power (for power/electrical markets)
+        if 'output_power' in segments and 'output_power' in segment_indices:
+            output_values = extract_segment_values(segment_indices['output_power'], 'output_power')
+            if output_values:
+                cleaned_values = []
+                for val in output_values:
+                    v = _norm(val)
+                    if not v:
+                        continue
+                    # ensure we use en-dash between numeric ranges
+                    v = re.sub(r'(\d)\s*[-]\s*(\d)', rf'\1{DASH}\2', v)
+                    if v not in cleaned_values:
+                        cleaned_values.append(v)
+                if cleaned_values:
+                    title_parts.append(f"By Output Power ({', '.join(cleaned_values[:6])})")
         
         # 1. Technology/Type (Diagnostic Technology or generic Product Type)
         if 'diagnostic' in segments:
@@ -2616,7 +2847,8 @@ def extract_title(docx_path: str) -> str:
                             else:
                                 cleaned_values.append(val)
                     if cleaned_values:
-                        title_parts.append(f"by Application ({', '.join(cleaned_values[:6])})")
+                        # Keep consistent capitalization for titles
+                        title_parts.append(f"By Application ({', '.join(cleaned_values[:6])})")
         
         # 3. End-User Industry
         if 'enduser' in segments:
@@ -2742,58 +2974,18 @@ def extract_title(docx_path: str) -> str:
         # 4. Region (Geography) - always add if segments found
         # Check if region segment was found in the document
         if 'region' in segments:
-            if 'region' in segment_indices:
-                region_values = extract_segment_values(segment_indices['region'], 'region')
-                if region_values:
-                    # Clean up region values
-                    cleaned_values = []
-                    for val in region_values:
-                        val_lower = val.lower()
-                        # Map to standard region names
-                        if 'north america' in val_lower:
-                            if 'North America' not in cleaned_values:
-                                cleaned_values.append('North America')
-                        elif 'europe' in val_lower and 'middle' not in val_lower:
-                            if 'Europe' not in cleaned_values:
-                                cleaned_values.append('Europe')
-                        elif 'asia' in val_lower and 'pacific' in val_lower:
-                            if 'Asia-Pacific' not in cleaned_values:
-                                cleaned_values.append('Asia-Pacific')
-                        elif 'latin america' in val_lower or 'lamea' in val_lower:
-                            if 'Latin America, Middle East & Africa' not in cleaned_values:
-                                cleaned_values.append('Latin America, Middle East & Africa')
-                        elif 'middle east' in val_lower and 'africa' in val_lower:
-                            if 'Latin America, Middle East & Africa' not in cleaned_values:
-                                cleaned_values.append('Latin America, Middle East & Africa')
-                        elif val not in cleaned_values:
-                            cleaned_values.append(val)
-                    
-                    if cleaned_values:
-                        if 'g-csf' in base_market_name.lower():
-                            title_parts.append(f"by Region ({', '.join(cleaned_values)})")
-                        else:
-                            title_parts.append(f"By Region ({', '.join(cleaned_values)})")
-                    else:
-                        if 'g-csf' in base_market_name.lower():
-                            title_parts.append("by Region")
-                        else:
-                            title_parts.append("By Region")
-                else:
-                    if 'g-csf' in base_market_name.lower():
-                        title_parts.append("by Region")
-                    else:
-                        title_parts.append("By Region")
+            # In long-form report titles, this is typically expressed as "By Geography"
+            # (even if the body text lists regions). Prefer this stable label.
+            if 'g-csf' in base_market_name.lower():
+                title_parts.append("by Region")
             else:
-                if 'g-csf' in base_market_name.lower():
-                    title_parts.append("by Region")
-                else:
-                    title_parts.append("By Region")
+                title_parts.append("By Geography")
         elif len(segments) >= 2:
             # If we have other segments, add Region anyway
             if 'g-csf' in base_market_name.lower():
                 title_parts.append("by Region")
             else:
-                title_parts.append("By Region")
+                title_parts.append("By Geography")
         
         # Add standard ending
         title_parts.append("Segment Revenue Estimation, Forecast, 2024–2030")
@@ -2861,7 +3053,7 @@ def extract_title(docx_path: str) -> str:
                 text_normalized = clean_text.lower().replace('-', ' ').replace('_', ' ')
                 # Check if at least some keywords match
                 matching_keywords = sum(1 for kw in filename_keywords if kw in text_normalized)
-                if matching_keywords >= min_keywords_needed:
+                if matching_keywords >= min_keywords_needed and not _is_section_heading_title(extracted_title):
                     return _ensure_filename_start_and_year(extracted_title, filename)
         
         # Priority 1.5: Look for full title with segmentation pattern
@@ -2878,7 +3070,8 @@ def extract_title(docx_path: str) -> str:
                     full_title = clean_text[:end_pos].strip()
                     # Remove "The Global" prefix
                     full_title = re.sub(r'^(?:The\s+)?Global\s+', '', full_title, flags=re.I).strip()
-                    return _norm(full_title)
+                    if not _is_section_heading_title(full_title):
+                        return _norm(full_title)
         
         # Priority 2: Look for patterns like "[Topic] Market" that contains filename
         text_normalized = clean_text.lower().replace('-', ' ').replace('_', ' ')
@@ -2900,14 +3093,15 @@ def extract_title(docx_path: str) -> str:
                 if forecast_match:
                     title_text = forecast_match.group(1).strip()
                     title_text = re.sub(r'^(?:The\s+)?Global\s+', '', title_text, flags=re.I).strip()
-                    return _ensure_filename_start_and_year(title_text, filename)
+                    if not _is_section_heading_title(title_text):
+                        return _ensure_filename_start_and_year(title_text, filename)
                 
                 # Otherwise extract up to "Market" or first sentence
                 title_match = re.search(r'^([^.]*?market)', clean_text, re.I)
                 if title_match:
                     title_text = title_match.group(1).strip()
-                    # Only use if it has substantial content
-                    if len(title_text.split()) >= 3:  # At least 3 words
+                    # Only use if it has substantial content and not a section heading
+                    if len(title_text.split()) >= 3 and not _is_section_heading_title(title_text):
                         return _ensure_filename_start_and_year(title_text, filename)
         
         # Priority 3: Look for "Forecast, 2024–2030" pattern with market name
@@ -2920,7 +3114,7 @@ def extract_title(docx_path: str) -> str:
                 if forecast_pos:
                     title_part = clean_text[:forecast_pos.end()].strip()
                     # Try to extract complete title
-                    if 'market' in title_part.lower():
+                    if 'market' in title_part.lower() and not _is_section_heading_title(clean_text):
                         return _ensure_filename_start_and_year(clean_text, filename)
     
         # Priority 4: Look for market name with "Market" keyword (flexible positioning)
@@ -2933,7 +3127,7 @@ def extract_title(docx_path: str) -> str:
                 if title_pattern:
                     title_text = title_pattern.group(1).strip()
                     title_text = re.sub(r'^(?:The\s+)?Global\s+', '', title_text, flags=re.I).strip()
-                    if len(title_text.split()) >= 3:
+                    if len(title_text.split()) >= 3 and not _is_section_heading_title(title_text):
                         return _ensure_filename_start_and_year(title_text, filename)
 
     # Last resort: If we found segmentation patterns but no full title, construct basic title
