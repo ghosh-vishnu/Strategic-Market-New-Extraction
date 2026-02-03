@@ -80,6 +80,28 @@ def _inline_title(text: str) -> str:
 def _year_range_present(text: str) -> bool:
     return bool(re.search(r"20\d{2}\s*[\-–]\s*20\d{2}", text))
 
+
+def _clean_final_title(title: str) -> str:
+    """Remove common doc artifacts from extracted title."""
+    if not title or len(title) < 5:
+        return title
+    # Remove '(Structured):' or '(Structured): ' prefix
+    title = re.sub(r"^\s*\(structured\)\s*:\s*", "", title, flags=re.I).strip()
+    # Remove duplicate market name: "Global Pediatric Catheter Market Pediatric Catheter Market By" -> "Global Pediatric Catheter Market By"
+    title = re.sub(
+        r"\b(Global\s+)?(.+?Market)\s+\2(\s+By\s+)",
+        r"\1\2\3",
+        title,
+        flags=re.I,
+    )
+    # Remove parentheticals that are narrative (e.g. "This is the most critical dimension of segmentation", "In 2024, SPECT/...")
+    title = re.sub(r"\s*\([^)]*this is the[^)]*\)", "", title, flags=re.I)
+    title = re.sub(r"\s*\(in 2024[^)]*\)", "", title, flags=re.I)
+    title = re.sub(r"\s*\([^)]*dimension of segmentation[^)]*\)", "", title, flags=re.I)
+    title = re.sub(r"\s{2,}", " ", title).strip()
+    return title
+
+
 def _ensure_filename_start_and_year(title: str, filename: str) -> str:
     # Normalize for comparison
     title_lower = title.lower()
@@ -90,16 +112,23 @@ def _ensure_filename_start_and_year(title: str, filename: str) -> str:
     # Extract key words from filename (excluding common words)
     filename_keywords = [w for w in filename_normalized.split() if w not in ['market', 'the', 'and', 'or']]
     
-    # Check if title already contains filename keywords (at least 3 keywords should match)
+    # Check if title already contains filename keywords
     matching_keywords = sum(1 for kw in filename_keywords if kw in title_normalized)
     
-    # Only prepend filename if title doesn't already contain it
-    if matching_keywords < min(3, len(filename_keywords)) and not title_lower.startswith(filename_lower):
+    # Don't prepend when title looks complete: has "Market", " By ", and (2+ filename keywords or 2+ "By" segments)
+    by_count = len(re.findall(r"\bby\s+\w", title_lower))
+    looks_complete = (
+        " by " in title_lower
+        and "market" in title_lower
+        and (matching_keywords >= min(2, len(filename_keywords)) or by_count >= 2)
+    )
+    # Only prepend filename if title doesn't already contain it (and isn't a complete doc title)
+    if not looks_complete and matching_keywords < min(3, len(filename_keywords)) and not title_lower.startswith(filename_lower):
         title = f"{filename} {title}"
     
     if not _year_range_present(title):
         title = f"{title} 2024{DASH}2030"
-    return _norm(title)
+    return _clean_final_title(_norm(title))
 
 # ✅ Detect list items
 def is_list_item(para):
@@ -1437,7 +1466,7 @@ HEADER_LINE_RE = re.compile(
         (?:[A-Za-z]\.)?
         (?:\d+(?:\.\d+)*)?
         [\.\)]?\s*
-        (?:report\s*title(?:\s*\(long[-–\s]*form\))?|full\s*title|full\s*report\s*title|title\s*\(long[-–\s]*form\))
+        (?:long[-–\s]*form\s*report\s*title|report\s*title(?:\s*\(long[-–\s]*form\))?(?:\s*format)?|full\s*title(?:\s*\(structured\))?\s*:?|full\s*report\s*title|title\s*\(long[-–\s]*form\))
         [\s:–-]*$
     """, re.I | re.X
 )
@@ -1562,6 +1591,34 @@ def extract_title(docx_path: str) -> str:
     filename_low = filename.lower()
     blocks = [(p, (p.text or "").strip()) for p in doc.paragraphs if (p.text or "").strip()]
 
+    # Priority -1: standalone "Report Title (Long-Form)" or "Long-Form Report Title" -> title may be next paragraph or same para after newline (Moved_Files_26 style)
+    for i, (_, text) in enumerate(blocks):
+        clean = remove_emojis(text)
+        # Same paragraph can be "A.1. Long-Form Report Title:\nMedical Nonwoven... Market By ... Forecast, 2024–2030"
+        if "\n" in clean:
+            first_line = clean.split("\n", 1)[0].strip()
+            rest = clean.split("\n", 1)[1].strip() if "\n" in clean else ""
+            if HEADER_LINE_RE.match(first_line) and len(rest) >= 40:
+                low = rest.lower()
+                by_count = len(re.findall(r"\bby\s+\w", low))
+                has_seg = "segment revenue estimation" in low and "forecast" in low
+                has_yr = bool(re.search(r"20\d{2}\s*[\-–]\s*20\d{2}", rest))
+                if (has_seg and has_yr) or (by_count >= 2 and "market" in low and has_yr):
+                    return _ensure_filename_start_and_year(_norm(rest), filename)
+        if not HEADER_LINE_RE.match(clean):
+            continue
+        if i + 1 >= len(blocks):
+            break
+        next_text = remove_emojis(blocks[i + 1][1])
+        if len(next_text) < 40:
+            continue
+        low = next_text.lower()
+        by_count = len(re.findall(r"\bby\s+\w", low))
+        has_seg = "segment revenue estimation" in low and "forecast" in low
+        has_yr = bool(re.search(r"20\d{2}\s*[\-–]\s*20\d{2}", next_text))
+        if (has_seg and has_yr) or (by_count >= 2 and "market" in low and has_yr):
+            return _ensure_filename_start_and_year(_norm(next_text), filename)
+
     # Priority 0: inline "Report Title (Long-Form) ..." lines
     for _, text in blocks:
         inline = _extract_labeled_inline_title(remove_emojis(text))
@@ -1606,6 +1663,8 @@ def extract_title(docx_path: str) -> str:
                         if nxt:
                             return _ensure_filename_start_and_year(nxt, filename)
 
+    # Collect paragraphs that look like the doc title (filename + forecast); prefer exact short form (no "(e.g.").
+    filename_forecast_candidates = []
     for _, text in blocks:
         low = text.lower()
         if low.startswith("full report title") or low.startswith("full title"):
@@ -1615,7 +1674,13 @@ def extract_title(docx_path: str) -> str:
         if low.startswith(filename_low) and "forecast" in low:
             if _is_section_heading_title(text):
                 continue
-            return _ensure_filename_start_and_year(text, filename)
+            filename_forecast_candidates.append(text)
+    # Prefer exact short title: if any candidate has no "(e.g.", use that (Moved_Files_26 style).
+    if filename_forecast_candidates:
+        for text in filename_forecast_candidates:
+            if "(e.g." not in text and "(e.g.," not in text:
+                return _ensure_filename_start_and_year(text, filename)
+        return _ensure_filename_start_and_year(filename_forecast_candidates[0], filename)
 
     # PRIORITY 0: Look for detailed segmented title format
     # Pattern: "[Market Name] Market By Treatment Type (...); By Diagnostic Approach (...); By End-User (...); By Region (...), Segment Revenue Estimation, Forecast, 2024–2030"
@@ -1683,7 +1748,7 @@ def extract_title(docx_path: str) -> str:
                 # Remove "The Global" prefix if present
                 full_title = re.sub(r'^(?:The\s+)?Global\s+', '', full_title, flags=re.I).strip()
                 
-                return _norm(full_title)
+                return _clean_final_title(_norm(full_title))
     
     # Also check in tables for detailed title
     for table in doc.tables:
@@ -1703,7 +1768,7 @@ def extract_title(docx_path: str) -> str:
                     full_title = re.sub(r'(20\d{2}.*?20\d{2}).*', r'\1', full_title).strip()
                     if filename_normalized.replace(' market', '') in full_title.lower():
                         full_title = re.sub(r'^(?:The\s+)?Global\s+', '', full_title, flags=re.I)
-                    return _norm(full_title)
+                    return _clean_final_title(_norm(full_title))
     
     # If detailed title not found as single string, try to construct it from segmentation sections
     # Look for paragraphs containing segmentation patterns
@@ -1828,7 +1893,7 @@ def extract_title(docx_path: str) -> str:
                 # Extract from start to forecast year
                 forecast_match = re.search(r'(.*?Forecast.*?20\d{2}.*?20\d{2})', constructed_title, re.I | re.DOTALL)
                 if forecast_match:
-                    return _norm(forecast_match.group(1).strip())
+                    return _clean_final_title(_norm(forecast_match.group(1).strip()))
     
     # If segmentation sections found, construct the detailed title
     if segmentation_found and len(segments) >= 2:
@@ -2503,6 +2568,11 @@ def extract_title(docx_path: str) -> str:
                                    'historical', 'overview', 'emerging', 'technological', 'stakeholders']
             
             for val in values:
+                # Strip "(e.g., X)" from segment values so we get short form (e.g. "Internal Stabilization Systems" not "Internal Stabilization Systems (e.g., Internal...")
+                if "(e.g." in val or "(e.g.," in val:
+                    val = val.split("(e.g.")[0].strip().split("(e.g.,")[0].strip()
+                if not val:
+                    continue
                 val_lower = val.lower()
                 
                 # Special handling for region section
@@ -2521,13 +2591,15 @@ def extract_title(docx_path: str) -> str:
                 # Skip if it's clearly not a valid segment value
                 invalid_patterns = [
                     'impact', 'trend', 'outlook', 'growth', 'share', 'targeted',
-                    'increased', 'access to', 'growth rate', 'expected to', 'driven by', 
-                    'the largest', 'improve patient', 'treatments to', 'outcomes', 
+                    'increased', 'access to', 'growth rate', 'expected to', 'driven by',
+                    'the largest', 'improve patient', 'treatments to', 'outcomes',
                     'healthcare infrastructure', 'reflects', 'differences in',
                     'definition and scope', 'overview of', 'research methodology', 'research process',
                     'primary and secondary', 'data sources', 'emerging opportunities', 'technological advances',
                     'across various', 'each targeting', 'each with', 'vary widely',
-                    'government and regulatory', 'historical market', 'market size and volume'
+                    'government and regulatory', 'historical market', 'market size and volume',
+                    'this is the most', 'this is the critical', 'dimension of segmentation',
+                    'in 2024,', 'in 2024 ', 'the most critical dimension',
                 ]
                 if (val_lower in invalid_patterns[:6] or 
                     any(phrase in val_lower for phrase in invalid_patterns[6:])):
@@ -2548,7 +2620,8 @@ def extract_title(docx_path: str) -> str:
                     
                 # Skip if it contains common description phrases
                 desc_phrases = ['the primary', 'this segment', 'this sub-segment', 'this application',
-                              'the end users', 'the market', 'the largest', 'the dominant']
+                              'the end users', 'the market', 'the largest', 'the dominant',
+                              'this is the', 'the most critical']
                 if any(phrase in val_lower for phrase in desc_phrases):
                     continue
                 
@@ -3012,7 +3085,7 @@ def extract_title(docx_path: str) -> str:
         else:
             constructed_title = separator.join(title_parts)
         
-        return _norm(constructed_title)
+        return _clean_final_title(_norm(constructed_title))
 
     # NEW LOGIC: Look for market report patterns in first few paragraphs
     # Increased to 50 paragraphs to catch titles that appear after intro text
@@ -3071,7 +3144,7 @@ def extract_title(docx_path: str) -> str:
                     # Remove "The Global" prefix
                     full_title = re.sub(r'^(?:The\s+)?Global\s+', '', full_title, flags=re.I).strip()
                     if not _is_section_heading_title(full_title):
-                        return _norm(full_title)
+                        return _clean_final_title(_norm(full_title))
         
         # Priority 2: Look for patterns like "[Topic] Market" that contains filename
         text_normalized = clean_text.lower().replace('-', ' ').replace('_', ' ')

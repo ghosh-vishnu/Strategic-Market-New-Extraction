@@ -56,6 +56,9 @@ def _job_is_authorized(request, job_id: str) -> bool:
 
 def _sanitize_filename(original_name: str, used_names: Set[str]) -> str:
     base_name = os.path.basename(original_name)
+    # Strip Word lock-file prefix so get_valid_filename doesn't produce truncated names (e.g. "llateral_..." from "~$Collateral...")
+    if base_name.startswith("~$") and len(base_name) > 2:
+        base_name = base_name[2:].lstrip()
     base_name = get_valid_filename(base_name)
 
     if not base_name:
@@ -276,6 +279,10 @@ def _convert_worker(job_id: str):
                 return
 
             path = folder / file
+            if not path.exists():
+                logger.warning(f"Skipping missing file: {path}")
+                continue
+
             logger.info(f"Processing {file}... ({i+1}/{total_files})")
 
             # extract fields
@@ -461,7 +468,14 @@ def _convert_worker(job_id: str):
 
     except Exception as e:
         logger.error(f"Error in conversion worker for job {job_id}: {str(e)}", exc_info=True)
-        JOBS[job_id]["error"] = str(e)
+        err_msg = str(e)
+        if "Package not found" in err_msg or "PackageNotFoundError" in type(e).__name__:
+            err_msg = (
+                "Could not open one of the Word files. "
+                "This often happens if the file was uploaded while open in Word (lock file). "
+                "Please close the document in Word and re-upload it."
+            )
+        JOBS[job_id]["error"] = err_msg
         JOBS[job_id]["done"] = True
         _cleanup_uploaded_files(folder)
         
