@@ -18,3 +18,25 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Test/Debug files and folders (not needed for production)
+file_11/
+Done/
+Extracted/
+Okay/
+Moved_Files_26/
+*.zip
+analyze_*.py
+compare_*.py
+debug_*.py
+inspect_*.py
+check_*.py
+# Exclude root-level test scripts, but keep backend/converter/tests/ (proper Django tests)
+/test_*.py
+debug_*.txt
+~$*.docx
+
+# Django
+*.log
+media/
+staticfiles/
