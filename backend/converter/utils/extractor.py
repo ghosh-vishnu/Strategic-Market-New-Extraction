@@ -1192,9 +1192,11 @@ def extract_seo_title(docx_path):
         if revenue_forecast:
             break
 
+    # SEO title: market name with spaces (no underscores)
+    title_name = file_name.replace("_", " ")
     if revenue_forecast:
-        return f"{file_name} Size ({revenue_forecast}) 2030"
-    return file_name
+        return f"{title_name} Size ({revenue_forecast}) 2030"
+    return title_name
 
 def extract_breadcrumb_text(docx_path):
     file_name = os.path.splitext(os.path.basename(docx_path))[0]
@@ -1231,9 +1233,11 @@ def extract_breadcrumb_text(docx_path):
         if revenue_forecast:
             break
 
+    # Breadcrumb: market name with spaces (no underscores)
+    title_name = file_name.replace("_", " ")
     if revenue_forecast:
-        return f"{file_name} Report 2030"
-    return file_name
+        return f"{title_name} Report 2030"
+    return title_name
 
 def extract_sku_code(docx_path):
     import re
@@ -4163,9 +4167,11 @@ def extract_seo_title(docx_path):
         if revenue_forecast:
             break
 
+    # SEO title: market name with spaces (no underscores)
+    title_name = file_name.replace("_", " ")
     if revenue_forecast:
-        return f"{file_name} Size ({revenue_forecast}) 2030"
-    return file_name
+        return f"{title_name} Size ({revenue_forecast}) 2030"
+    return title_name
 
 def extract_breadcrumb_text(docx_path):
     file_name = os.path.splitext(os.path.basename(docx_path))[0]
@@ -4202,9 +4208,11 @@ def extract_breadcrumb_text(docx_path):
         if revenue_forecast:
             break
 
+    # Breadcrumb: market name with spaces (no underscores)
+    title_name = file_name.replace("_", " ")
     if revenue_forecast:
-        return f"{file_name} Report 2030"
-    return file_name
+        return f"{title_name} Report 2030"
+    return title_name
 
 def extract_sku_code(docx_path):
     import re
