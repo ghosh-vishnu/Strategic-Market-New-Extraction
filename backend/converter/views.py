@@ -305,8 +305,10 @@ def _convert_worker(job_id: str):
             # ✅ split into parts
             chunks = extractor.split_into_excel_cells(merged_text)
 
+            # File column: show filename with underscores replaced by spaces
+            file_display = file.replace("_", " ")
             row_data = {
-                "File": file,
+                "File": file_display,
                 "Title": title,
             }
 
